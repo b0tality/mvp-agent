@@ -1,0 +1,129 @@
+# ============================================================================
+# 多智能体应用开发系统 - Docker Compose 监控服务配置
+# ============================================================================
+
+version: '3.8'
+
+# ----------------------------------------------------------------------------
+# 服务定义
+services:
+  # ==========================================================================
+  # Node Exporter - 系统指标
+  # ==========================================================================
+  node-exporter:
+    image: prom/node-exporter:v1.6.1
+    container_name: multi-agent-node-exporter
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - multi-agent-network
+
+  # ==========================================================================
+  # PostgreSQL Exporter - 数据库指标
+  # ==========================================================================
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: multi-agent-postgres-exporter
+    restart: unless-stopped
+    ports:
+      - "9187:9187"
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-multi_agent}?sslmode=disable
+    depends_on:
+      - postgres
+    networks:
+      - multi-agent-network
+
+  # ==========================================================================
+  # Redis Exporter - 缓存指标
+  # ==========================================================================
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.54.0
+    container_name: multi-agent-redis-exporter
+    restart: unless-stopped
+    ports:
+      - "9121:9121"
+    environment:
+      - REDIS_ADDR=redis://redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-redis}
+    depends_on:
+      - redis
+    networks:
+      - multi-agent-network
+
+  # ==========================================================================
+  # Nginx Exporter - Web服务器指标
+  # ==========================================================================
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:0.11
+    container_name: multi-agent-nginx-exporter
+    restart: unless-stopped
+    ports:
+      - "9113:9113"
+    command:
+      - '-nginx.scrape-uri=http://nginx:8080/stub_status'
+    depends_on:
+      - nginx
+    networks:
+      - multi-agent-network
+
+  # ==========================================================================
+  # cAdvisor - 容器指标
+  # ==========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.47.2
+    container_name: multi-agent-cadvisor
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices:
+      - /dev/kmsg
+    networks:
+      - multi-agent-network
+
+  # ==========================================================================
+  # Alertmanager - 告警管理
+  # ==========================================================================
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: multi-agent-alertmanager
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    networks:
+      - multi-agent-network
+
+# ----------------------------------------------------------------------------
+# 数据卷
+volumes:
+  alertmanager_data:
+    driver: local
+
+# ----------------------------------------------------------------------------
+# 网络
+networks:
+  multi-agent-network:
+    driver: bridge

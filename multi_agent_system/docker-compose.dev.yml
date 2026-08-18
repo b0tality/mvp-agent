@@ -1,0 +1,196 @@
+# ============================================================================
+# 多智能体应用开发系统 - Docker Compose 开发环境配置
+# ============================================================================
+
+version: '3.8'
+
+# ----------------------------------------------------------------------------
+# 服务定义
+services:
+  # ==========================================================================
+  # 主应用服务 (开发模式)
+  # ==========================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: multi-agent-app-dev
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "5678:5678"    # 调试端口
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4}
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/multi_agent_dev
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=development
+      - DEBUG=1
+    volumes:
+      - .:/app                    # 热重载
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - multi-agent-dev
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+
+  # ==========================================================================
+  # PostgreSQL 数据库 (开发环境)
+  # ==========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: multi-agent-postgres-dev
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=multi_agent_dev
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - multi-agent-dev
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Redis 缓存 (开发环境)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: multi-agent-redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_dev_data:/data
+    networks:
+      - multi-agent-dev
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Celery Worker (开发环境)
+  # ==========================================================================
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: multi-agent-celery-worker-dev
+    restart: unless-stopped
+    command: celery -A app.celery worker --loglevel=debug --concurrency=2
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/multi_agent_dev
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - multi-agent-dev
+
+  # ==========================================================================
+  # Adminer - 数据库管理
+  # ==========================================================================
+  adminer:
+    image: adminer:latest
+    container_name: multi-agent-adminer-dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - multi-agent-dev
+
+  # ==========================================================================
+  # Redis Commander - Redis 管理
+  # ==========================================================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: multi-agent-redis-commander-dev
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - multi-agent-dev
+
+  # ==========================================================================
+  # Mailhog - 邮件测试
+  # ==========================================================================
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: multi-agent-mailhog-dev
+    restart: unless-stopped
+    ports:
+      - "1025:1025"    # SMTP
+      - "8025:8025"    # Web UI
+    networks:
+      - multi-agent-dev
+
+  # ==========================================================================
+  # MinIO - 对象存储 (可选)
+  # ==========================================================================
+  minio:
+    image: minio/minio:latest
+    container_name: multi-agent-minio-dev
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - multi-agent-dev
+    profiles:
+      - storage
+
+# ----------------------------------------------------------------------------
+# 数据卷
+volumes:
+  postgres_dev_data:
+    driver: local
+  redis_dev_data:
+    driver: local
+  minio_data:
+    driver: local
+
+# ----------------------------------------------------------------------------
+# 网络
+networks:
+  multi-agent-dev:
+    driver: bridge

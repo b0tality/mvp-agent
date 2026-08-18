@@ -1,0 +1,32 @@
+# ============================================================================
+# GitHub CODEOWNERS 配置
+# ============================================================================
+# 用于自动分配代码审查者
+
+# 默认所有者
+* @maintainer-username
+
+# 智能体代码
+/agents/requirements/ @agent-team
+/agents/technical/ @agent-team
+/agents/mvp/ @agent-team
+/agents/code_review/ @agent-team
+/agents/testing/ @agent-team
+/agents/deployment/ @agent-team
+
+# 配置文件
+/config/ @devops-team
+/docker-compose*.yml @devops-team
+/Dockerfile* @devops-team
+/.github/ @devops-team
+
+# 文档
+/docs/ @docs-team
+*.md @docs-team
+
+# 测试
+/tests/ @qa-team
+
+# 依赖
+/requirements.txt @security-team
+/package.json @security-team

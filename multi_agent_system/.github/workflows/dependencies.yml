@@ -1,0 +1,146 @@
+# ============================================================================
+# 多智能体应用开发系统 - 依赖更新工作流
+# ============================================================================
+
+name: Dependencies Update
+
+on:
+  schedule:
+    # 每周一早上 9 点 (UTC) 运行
+    - cron: '0 9 * * 1'
+  
+  workflow_dispatch:
+
+# ============================================================================
+# 工作流任务
+# ============================================================================
+jobs:
+  # --------------------------------------------------------------------------
+  # Python 依赖更新
+  # --------------------------------------------------------------------------
+  update-python:
+    name: 更新 Python 依赖
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: 安装 pip-tools
+        run: pip install pip-tools
+      
+      - name: 更新依赖
+        run: |
+          pip-compile --upgrade --output-file=requirements.txt requirements.in
+        continue-on-error: true
+      
+      - name: 安装更新后的依赖
+        run: pip install -r requirements.txt
+        continue-on-error: true
+      
+      - name: 运行测试
+        run: |
+          pytest tests/unit/ -v --tb=short
+        continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      
+      - name: 创建 Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'chore: update python dependencies'
+          title: 'chore: update python dependencies'
+          body: |
+            ## 依赖更新
+            
+            自动更新 Python 依赖到最新版本。
+            
+            ### 变更
+            - 更新 requirements.txt
+            
+            ### 检查
+            - [ ] 测试通过
+            - [ ] 没有破坏性变更
+          branch: chore/update-dependencies
+          delete-branch: true
+
+  # --------------------------------------------------------------------------
+  # Docker 基础镜像更新
+  # --------------------------------------------------------------------------
+  update-docker:
+    name: 更新 Docker 镜像
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 检查 Python 镜像更新
+        run: |
+          CURRENT=$(grep -oP 'FROM python:\K[0-9.]+' Dockerfile)
+          LATEST=$(curl -s https://hub.docker.com/v2/repositories/library/python/tags?page_size=100 | jq -r '.results[].name' | grep -E '^[0-9.]+-slim$' | head -1 | sed 's/-slim//')
+          
+          echo "当前版本: $CURRENT"
+          echo "最新版本: $LATEST"
+          
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "需要更新 Docker 基础镜像"
+          fi
+
+  # --------------------------------------------------------------------------
+  # GitHub Actions 更新
+  # --------------------------------------------------------------------------
+  update-actions:
+    name: 更新 GitHub Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 更新 Actions
+        uses: technote-space/auto-update-actions@v3
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # --------------------------------------------------------------------------
+  # 安全漏洞检查
+  # --------------------------------------------------------------------------
+  security-audit:
+    name: 安全漏洞检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 安装依赖
+        run: pip install safety pip-audit
+      
+      - name: 运行安全检查
+        run: |
+          pip-audit -r requirements.txt
+        continue-on-error: true
+      
+      - name: 创建安全报告
+        if: failure()
+        run: |
+          echo "发现安全漏洞，请查看报告"

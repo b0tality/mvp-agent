@@ -1,0 +1,82 @@
+# ============================================================================
+# 复用 Action - Python 测试
+# ============================================================================
+
+name: 'Python Test'
+description: '运行 Python 测试并生成覆盖率报告'
+
+inputs:
+  python-version:
+    description: 'Python 版本'
+    required: false
+    default: '3.11'
+  
+  test-path:
+    description: '测试路径'
+    required: false
+    default: 'tests/'
+  
+  coverage-threshold:
+    description: '覆盖率阈值'
+    required: false
+    default: '80'
+
+outputs:
+  coverage:
+    description: '测试覆盖率'
+    value: ${{ steps.test.outputs.coverage }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 设置 Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: 'pip'
+    
+    - name: 安装依赖
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov pytest-mock
+    
+    - name: 运行测试
+      id: test
+      shell: bash
+      run: |
+        pytest ${{ inputs.test-path }} \
+          -v \
+          --tb=short \
+          --cov=agents \
+          --cov-report=xml:coverage.xml \
+          --cov-report=term-missing
+        
+        # 提取覆盖率
+        COVERAGE=$(python -c "
+        import xml.etree.ElementTree as ET
+        tree = ET.parse('coverage.xml')
+        root = tree.getroot()
+        print(root.attrib.get('line-rate', '0'))
+        ")
+        
+        echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+        echo "覆盖率: $COVERAGE"
+    
+    - name: 检查覆盖率
+      shell: bash
+      run: |
+        COVERAGE=${{ steps.test.outputs.coverage }}
+        THRESHOLD=${{ inputs.coverage-threshold }}
+        
+        if (( $(echo "$COVERAGE < $THRESHOLD/100" | bc -l) )); then
+          echo "警告: 覆盖率 ($COVERAGE) 低于阈值 ($THRESHOLD%)"
+        fi
+    
+    - name: 上传覆盖率
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+      continue-on-error: true
