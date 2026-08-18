@@ -6,6 +6,8 @@ import asyncio
 import argparse
 import json
 import os
+import re
+import shutil
 from dotenv import load_dotenv
 
 from config.settings import PipelineConfig
@@ -15,6 +17,7 @@ from agents.technical import TechnicalAgent
 from agents.mvp import MVPAgent
 from agents.code_review import CodeReviewAgent
 from agents.testing import TestingAgent
+from agents.acceptance import AcceptanceAgent
 from agents.deployment import DeploymentAgent
 from pipeline import PipelineOrchestrator
 
@@ -64,10 +67,11 @@ async def run_pipeline(user_input: str) -> None:
         "mvp": MVPAgent(llm),
         "code_review": CodeReviewAgent(llm),
         "testing": TestingAgent(llm),
+        "acceptance": AcceptanceAgent(llm),
         "deployment": DeploymentAgent(llm),
     }
 
-    orchestrator = PipelineOrchestrator(agents, max_iterations=3)
+    orchestrator = PipelineOrchestrator(agents, max_iterations=4)
 
     print("\n" + "=" * 60)
     print("运行完整流水线（含迭代优化）...")
@@ -90,9 +94,8 @@ async def run_pipeline(user_input: str) -> None:
 
     print("=" * 60)
 
-    # 把生成的代码落盘
-    if result.status in ("success", "partial"):
-        save_generated_code(result)
+    # 把生成的代码落盘（无论成败都保存，失败时 summary 会记录原因，便于排查）
+    save_generated_code(result)
 
 
 OUTPUT_BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -114,8 +117,10 @@ def save_generated_code(result) -> str | None:
         return None
 
     data = mvp.data
-    project_name = data.get("project_name") or "mvp_project"
+    raw_name = str(data.get("project_name") or "mvp_project")
+    project_name = re.sub(r"[^0-9a-zA-Z_]+", "_", raw_name).strip("_").lower() or "mvp_project"
     project_dir = os.path.join(OUTPUT_BASE, project_name)
+    shutil.rmtree(project_dir, ignore_errors=True)  # 清掉上一次运行的残留文件
     written = 0
 
     def write_file(rel_path: str, content: str) -> None:
@@ -135,6 +140,12 @@ def save_generated_code(result) -> str | None:
         write_file(cf.get("path", ""), cf.get("content", ""))
     for tf in data.get("test_files", []):
         write_file(tf.get("path", ""), tf.get("content", ""))
+
+    # 兜底：若 LLM 没生成 requirements.txt，写入默认依赖
+    has_req = any((cf.get("path") or "").strip().lstrip("/\\") == "requirements.txt"
+                  for cf in data.get("code_files", []))
+    if not has_req:
+        write_file("requirements.txt", "fastapi>=0.104\nuvicorn>=0.24\npytest>=7\nhttpx>=0.24\n")
 
     # 部署产物
     deploy = result.stages.get("deployment")
@@ -160,6 +171,7 @@ def _build_summary(result, project_name: str) -> dict:
     tech = stage_data("technical")
     review = stage_data("code_review")
     testing = stage_data("testing")
+    accept = stage_data("acceptance")
     deploy = stage_data("deployment")
 
     return {
@@ -178,7 +190,30 @@ def _build_summary(result, project_name: str) -> dict:
         ],
         "code_review_score": review.get("overall_score"),
         "code_review_issues": len(review.get("issues", [])),
+        "code_review": {
+            "score": review.get("overall_score"),
+            "issues": review.get("issues", []),
+            "summary": review.get("summary", ""),
+        },
         "testing_bugs": len(testing.get("bugs", [])),
+        "testing": {
+            "total_tests": testing.get("total_tests"),
+            "passed": testing.get("passed"),
+            "failed": testing.get("failed"),
+            "all_passed": testing.get("all_passed"),
+            "coverage_line": (testing.get("coverage") or {}).get("line"),
+            "smoke": testing.get("smoke_test", {}),
+            "bugs": testing.get("bugs", []),
+            "raw_output": testing.get("raw_output", "")[:6000],
+        },
+        "acceptance": {
+            "total": accept.get("total"),
+            "passed": accept.get("passed"),
+            "failed": accept.get("failed"),
+            "all_passed": accept.get("all_passed"),
+            "results": accept.get("results", []),
+            "raw_output": accept.get("raw_output", "")[:6000],
+        },
         "deployment_strategy": (deploy.get("deployment_plan") or {}).get("strategy"),
     }
 

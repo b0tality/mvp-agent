@@ -84,21 +84,24 @@ class MVPAgent(BaseAgent):
     ) -> MVPCodeOutput:
         """首次生成代码"""
         return await self.llm.generate_structured(
-            """你是一位资深全栈开发工程师。请根据需求和技术栈生成MVP代码。
+            """你是一位资深全栈开发工程师。请生成一个可运行的 Web MVP（后端 FastAPI + 极简前端）。
 
-要求：
-1. 必须生成至少2-3个代码文件（如main.py, models.py, routes.py）
-2. 每个文件必须包含完整的可运行代码
-3. 代码使用指定的技术栈
-4. 生成requirements.txt或package.json等依赖文件
-5. 项目名称使用小写字母和下划线
-6. 确保代码语法正确，没有缩进错误""",
+硬性要求：
+1. 后端用 FastAPI，主入口必须是 main.py，且包含 `app = FastAPI(...)`（这样能 `uvicorn main:app` 启动）。
+2. 所有代码文件放在项目根目录（扁平结构，模块间用相对导入，如 `from models import X`）。
+3. 只生成一个测试文件 tests/test_api.py（放入 test_files 字段，不是 code_files），用 pytest + httpx 的 AsyncClient + ASGITransport（或 fastapi.testclient.TestClient）打内存中的 app；
+   覆盖每个核心功能（含正常用例和异常/边界用例）。禁止生成用 requests 打真实服务器（127.0.0.1）的测试，禁止生成 test_acceptance.py。
+4. 必须生成 requirements.txt（列出 fastapi、uvicorn、pytest、httpx 等依赖）。
+5. 功能要真实实现，不能是 TODO 占位；接口要返回正确数据。
+6. 项目名称放在 project_name 字段，小写字母+下划线。
+7. 若生成前端静态页面（如 index.html），必须在 main.py 里用 StaticFiles 或路由把它服务出来；否则不要生成前端文件。
+8. 代码语法正确、可编译、无缩进错误。""",
             f"""需求：{requirements}
 技术栈：{tech_stack}
 API设计：{api_design}
 数据库设计：{db_design}
 
-请生成完整的MVP代码，包含所有必要的文件。""",
+请生成完整的、可直接运行的 Web MVP 代码和测试。""",
             MVPCodeOutput,
         )
 
@@ -148,6 +151,28 @@ API设计：{api_design}
                 feedback_text += f"- [{severity}] {desc}\n"
             feedback_text += "\n"
 
+        test_output = feedback.get("test_output", "")
+        if test_output:
+            feedback_text += "真实测试运行输出（务必让所有测试通过，看 traceback 定位）：\n"
+            feedback_text += test_output[:4000]
+            feedback_text += "\n\n"
+
+        acceptance_failures = feedback.get("acceptance_failures", [])
+        if acceptance_failures:
+            feedback_text += "验收标准未满足（需求 vs 实现的差距，必须按需求修复，不要迁就代码现有行为）：\n"
+            for a in acceptance_failures:
+                cid = a.get("criterion_id", "")
+                desc = a.get("description", "")
+                detail = a.get("detail", "")
+                feedback_text += f"- [{cid}] {desc} — {detail}\n"
+            feedback_text += "\n"
+
+        acceptance_raw = feedback.get("acceptance_raw_output", "")
+        if acceptance_raw:
+            feedback_text += "验收测试原始输出（看具体断言差异，按需求修正）：\n"
+            feedback_text += acceptance_raw[:3000]
+            feedback_text += "\n\n"
+
         if suggestions:
             feedback_text += "改进建议：\n"
             for s in suggestions:
@@ -156,12 +181,14 @@ API设计：{api_design}
         return await self.llm.generate_structured(
             f"""你是一位资深全栈开发工程师。这是第{iteration}次代码改进。
 
-请根据以下反馈修复代码中的问题：
+请根据以下反馈修复代码，目标是让真实测试全部通过：
 1. 优先修复编译/语法错误（必须修复）
-2. 修复所有标记为 critical 和 major 的问题
-3. 修复所有Bug
-4. 保留代码的正常功能
-5. 确保修复后的代码语法正确、可编译""",
+2. 修复所有 critical 和 major 的问题
+3. 修复所有失败的测试（参考「真实测试运行输出」里的 traceback 和断言差异）
+4. 只做针对性最小修改，不要重写已通过测试的代码，不要删除已有端点/功能
+5. 若验收要求某类输入返回特定状态码（如 400），而当前返回的是框架默认值（如 FastAPI 的 422 校验错误），需显式处理（添加 RequestValidationError 异常处理器返回 400，或改为手动校验），而不是让框架兜底返回 422
+6. 确保修复后的代码语法正确、可编译、可运行
+7. 必须输出 test_files 字段：重新生成测试文件 tests/test_api.py，用 pytest + httpx 覆盖所有核心功能（含正常与异常/边界用例）。不要把测试文件放进 code_files。""",
             f"""当前代码：
 {current_code}
 

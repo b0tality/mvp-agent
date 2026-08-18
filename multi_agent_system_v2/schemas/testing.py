@@ -41,3 +41,6 @@ class TestingOutput(BaseModel):
     failed: int = Field(default=0, description="失败数")
     summary: str = Field(default="", description="测试总结")
     suggestions: List[str] = Field(default_factory=list, description="改进建议列表")
+    all_passed: bool = Field(default=False, description="全部测试是否通过（真实执行结果）")
+    smoke_test: Dict[str, Any] = Field(default_factory=dict, description="应用启动冒烟测试结果")
+    raw_output: str = Field(default="", description="测试原始输出")

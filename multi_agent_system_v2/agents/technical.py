@@ -28,10 +28,15 @@ class TechnicalAgent(BaseAgent):
             result = await self.llm.generate_structured(
                 """你是一位资深技术架构师。请根据需求设计完整的技术方案。
 
+硬性约束：
+- 后端必须用 Python + FastAPI（我们只对 Python 做真实执行验证），主入口为 main.py 含 `app = FastAPI(...)`。
+- 前端可用极简静态页面（HTML/JS），或纯 API（无前端）。
+- 数据库如非必需，用内存/文件存储即可，避免引入外部依赖。
+
 要求：
 1. 设计系统架构（选择合适的架构模式）
-2. 选择技术栈（后端、前端、数据库）
-3. 设计RESTful API
+2. 选择技术栈（后端固定 Python/FastAPI）
+3. 设计RESTful API（方法 + 路径 + 描述）
 4. 设计数据库schema
 5. 设计安全方案
 6. 估算开发成本""",

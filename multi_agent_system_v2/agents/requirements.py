@@ -54,9 +54,11 @@ class RequirementsAgent(BaseAgent):
             # 2. 生成用户故事
             stories = await self.story_gen.run(requirements=parsed)
 
-            # 3. 生成验收标准
+            # 3. 生成验收标准（锚定原始需求，保留可验证细节）
             criteria = await self.criteria_gen.run(
-                user_stories=stories.get("user_stories", [])
+                user_stories=stories.get("user_stories", []),
+                requirements=parsed,
+                user_input=user_input,
             )
 
             # 4. 优先级排序

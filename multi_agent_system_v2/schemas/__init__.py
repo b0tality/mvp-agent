@@ -22,6 +22,7 @@ from .technical import (
 )
 from .code import CodeFile, MVPCodeOutput, CodeReviewIssue, CodeReviewOutput
 from .testing import TestCase, TestCoverage, Bug, TestingOutput
+from .acceptance import AcceptanceResult, AcceptanceOutput
 from .deployment import (
     DeploymentEnvironment,
     DeploymentPlan,
@@ -60,6 +61,9 @@ __all__ = [
     "TestCoverage",
     "Bug",
     "TestingOutput",
+    # Acceptance
+    "AcceptanceResult",
+    "AcceptanceOutput",
     # Deployment
     "DeploymentEnvironment",
     "DeploymentPlan",

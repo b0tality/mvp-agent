@@ -60,23 +60,29 @@ class AcceptanceCriteriaTool(BaseTool):
     """验收标准生成工具"""
 
     name = "acceptance_criteria_generator"
-    description = "为用户故事生成验收标准"
+    description = "根据原始需求生成可执行、可验证的验收标准"
 
     async def run(self, **kwargs) -> Dict[str, Any]:
         user_stories = kwargs.get("user_stories", [])
-        system_prompt = """你是一位资深测试工程师。请为用户故事生成验收标准。
+        requirements = kwargs.get("requirements", {})
+        user_input = kwargs.get("user_input", "")
+        system_prompt = """你是一位资深测试工程师。请根据原始需求生成可执行、可验证的验收标准。
 
-每个验收标准包含：id, story_id, description"""
-        
+硬性要求：
+1. 每个验收标准包含：id, story_id, description
+2. 必须保留原始需求里的具体可验证细节：状态码（如 400/404）、字段名、边界值、精确行为。禁止把「非数字输入返回 400」泛化成「返回错误提示」这类模糊描述。
+3. 每条验收标准要能被一段代码或一个 HTTP 请求客观判断通过/不通过。
+4. 覆盖所有功能需求，尤其是错误处理和边界条件。"""
+
         from schemas import AcceptanceCriterion
         from pydantic import BaseModel
-        
+
         class CriteriaList(BaseModel):
             acceptance_criteria: List[AcceptanceCriterion]
-        
+
         result = await self.llm.generate_structured(
             system_prompt,
-            f"请为以下用户故事生成验收标准：\n{user_stories}",
+            f"原始需求：{user_input}\n\n结构化需求：{requirements}\n\n用户故事：{user_stories}",
             CriteriaList
         )
         return result.model_dump()
