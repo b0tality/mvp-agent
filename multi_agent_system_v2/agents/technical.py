@@ -32,6 +32,9 @@ class TechnicalAgent(BaseAgent):
 - 后端必须用 Python + FastAPI（我们只对 Python 做真实执行验证），主入口为 main.py 含 `app = FastAPI(...)`。
 - 前端可用极简静态页面（HTML/JS），或纯 API（无前端）。
 - 数据库如非必需，用内存/文件存储即可，避免引入外部依赖。
+- 密码哈希/认证必须用 Python 标准库（hashlib.pbkdf2_hmac 或 hmac+hashlib+盐），
+  **禁止选用 passlib/bcrypt**（passlib 与新版 bcrypt 不兼容）。JWT 可用 PyJWT 或手写 HMAC。
+  尽量少引入第三方依赖，能 stdlib 就 stdlib。
 
 要求：
 1. 设计系统架构（选择合适的架构模式）

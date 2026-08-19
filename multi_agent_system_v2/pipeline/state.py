@@ -20,10 +20,11 @@ class StageRecord(BaseModel):
 class IterationRecord(BaseModel):
     """迭代记录"""
     iteration: int
-    stage: str  # 触发迭代的阶段（code_review/testing）
+    stage: str  # 触发迭代的阶段（code_review/testing/acceptance）
     reason: str  # 迭代原因
     issues_count: int = 0
     bugs_count: int = 0
+    acceptance_failures: int = 0
 
 
 class PipelineState:

@@ -92,6 +92,10 @@ class MVPAgent(BaseAgent):
 3. 只生成一个测试文件 tests/test_api.py（放入 test_files 字段，不是 code_files），用 pytest + httpx 的 AsyncClient + ASGITransport（或 fastapi.testclient.TestClient）打内存中的 app；
    覆盖每个核心功能（含正常用例和异常/边界用例）。禁止生成用 requests 打真实服务器（127.0.0.1）的测试，禁止生成 test_acceptance.py。
 4. 必须生成 requirements.txt（列出 fastapi、uvicorn、pytest、httpx 等依赖）。
+   尽量用标准库实现，减少外部依赖。密码哈希**必须用标准库** hashlib（如 pbkdf2_hmac 或 sha256+随机盐），
+   **禁止引入 passlib/bcrypt**（passlib 1.7.4 与 bcrypt>=4.1 不兼容，会报
+   "password cannot be longer than 72 bytes" 或 "bcrypt has no attribute __about__"）。
+   JWT 可用 PyJWT（import jwt as pyjwt），或手写 HMAC 签名；不要从 main 里 import jwt 别名。
 5. 功能要真实实现，不能是 TODO 占位；接口要返回正确数据。
 6. 项目名称放在 project_name 字段，小写字母+下划线。
 7. 若生成前端静态页面（如 index.html），必须在 main.py 里用 StaticFiles 或路由把它服务出来；否则不要生成前端文件。

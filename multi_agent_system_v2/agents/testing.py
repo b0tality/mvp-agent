@@ -1,31 +1,31 @@
 """
-测试Agent —— 真实执行验证
+测试Agent —— 真实验证 + 确定性不变式测试
 
-不再让LLM"假装"测试，而是把生成的代码真实跑起来：
-1. 把代码 + 测试写入沙箱
-2. 真实运行 pytest（含集成测试，用 TestClient 打真实接口）
-3. 启动应用做冒烟探活（导入 FastAPI 实例，GET /openapi.json 和 /）
-4. 测量行覆盖率（coverage 可用时）
-5. 返回真实结果，失败信息用于回灌 MVP 修复
+两层职责：
+1. 基线：真实运行 Builder 自带的测试（pytest + coverage + 冒烟）。
+2. 不变式：从应用的 OpenAPI 契约（真实执行 app.openapi()）机械推导「通用不变式」测试
+   （id 唯一性/计数一致/删除后 404），真实运行，失败即真 bug。
+
+关键：不变式测试**不是 LLM 写的**，是确定性的、与生成代码的盲区无关的独立裁判——
+直接对治「作者自测与代码同源」的 sham。原来的 LLM 对抗测试（red-team QA）因为贵且会
+误报（状态隔离、臆测未定义行为），已被这条确定性路径取代。
 """
 
-import os
 import re
-import sys
-import json
 import time
-import shutil
-import tempfile
-import subprocess
-import importlib.util
 from typing import Dict, Any, List
 
 from agents.base import BaseAgent, AgentResult
 from llm.adapter import LLMAdapter
+from tools.executors import run_tests
+from tools.invariant_tests import generate_invariant_tests
+
+
+_ADVERSARIAL_SYSTEM = """（保留：历史对抗测试提示词，当前流程已改用确定性不变式测试，不再调用。）"""
 
 
 class TestingAgent(BaseAgent):
-    """测试Agent：真实执行验证"""
+    """测试Agent：真实执行验证 + 对抗性找 bug"""
 
     name = "testing"
 
@@ -49,242 +49,71 @@ class TestingAgent(BaseAgent):
 
         start = time.time()
         try:
-            data = await self._run_real_tests(code_files, test_files)
+            data = await run_tests(code_files, test_files, timeout=self.timeout)
+
+            # 确定性不变式测试：非 LLM，从 OpenAPI 契约机械推导，硬门槛（真 bug）
+            try:
+                inv_code = generate_invariant_tests(code_files)
+            except Exception:
+                inv_code = ""
+
+            if (inv_code or "").strip():
+                inv_file = {"path": "tests/test_invariants.py", "content": inv_code, "language": "python"}
+                combined = await run_tests(code_files, test_files + [inv_file], timeout=self.timeout)
+                # 不变式测试文件本身没被正确收集（生成器有 bug）→ 退回基线，不把坏测试当 bug
+                if not self._adversarial_invalid(combined, data):
+                    combined["invariants_generated"] = True
+                    data = combined
+
             return self._success(data, time.time() - start)
         except Exception as e:
             return self._error(str(e), time.time() - start)
 
-    async def _run_real_tests(self, code_files: List[Dict], test_files: List[Dict]) -> Dict[str, Any]:
-        """把代码写入沙箱并真实执行测试。"""
-        sandbox = tempfile.mkdtemp(prefix="magent_test_")
-        try:
-            self._write_files(sandbox, code_files)
-            self._write_files(sandbox, test_files)
+    async def _generate_adversarial_tests(self, code_files: List[Dict], test_files: List[Dict]) -> str:
+        user = f"代码文件：\n{code_files}\n\n现有测试：\n{test_files}"
+        code = await self.llm.generate(_ADVERSARIAL_SYSTEM, user)
+        return self._strip_code_fences(code)
 
-            # 1. 真实运行 pytest（coverage 可用时顺带测覆盖率）
-            pytest_result, coverage = self._run_pytest_with_coverage(sandbox)
-
-            # 2. 启动应用做冒烟探活
-            smoke = self._run_smoke_test(sandbox)
-
-            bugs = self._extract_bugs(pytest_result)
-
-            # 至少要有测试真实跑起来并全部通过才算 all_passed（0 个测试不算通过）
-            no_tests = pytest_result["passed"] == 0 and pytest_result["failed"] == 0
-            all_passed = (pytest_result["failed"] == 0 and not no_tests
-                          and smoke.get("passed", False))
-
-            return {
-                "test_cases": [],
-                "coverage": coverage,
-                "bugs": bugs,
-                "total_tests": pytest_result["total"],
-                "passed": pytest_result["passed"],
-                "failed": pytest_result["failed"],
-                "all_passed": all_passed,
-                "smoke_test": smoke,
-                "summary": pytest_result["summary"],
-                "suggestions": self._extract_suggestions(pytest_result, bugs),
-                "raw_output": pytest_result["raw"],
-            }
-        finally:
-            shutil.rmtree(sandbox, ignore_errors=True)
-
-    # ------------------------------------------------------------------
-    # 文件与执行
-    # ------------------------------------------------------------------
-    def _write_files(self, sandbox: str, files: List[Dict]) -> None:
-        for f in files:
-            path = (f.get("path") or "").strip().lstrip("/\\")
-            content = f.get("content") or ""
-            if not path or not content:
-                continue
-            clean = os.path.normpath(path)
-            if clean.startswith("..") or os.path.isabs(clean):
-                continue
-            dest = os.path.join(sandbox, clean)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(content)
-
-    def _env(self, sandbox: str) -> Dict[str, str]:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = sandbox + os.pathsep + env.get("PYTHONPATH", "")
-        env["PYTHONIOENCODING"] = "utf-8"
-        return env
-
-    def _run_pytest_with_coverage(self, sandbox: str):
-        """运行 pytest，coverage 可用时顺带测覆盖率。返回 (pytest_result, coverage)。"""
-        env = self._env(sandbox)
-        coverage_available = importlib.util.find_spec("coverage") is not None
-
-        base = [sys.executable, "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider"]
-        if coverage_available:
-            cmd = [sys.executable, "-m", "coverage", "run", "--source=.", "-m", "pytest",
-                   "-q", "--tb=short", "-p", "no:cacheprovider"]
-        else:
-            cmd = base
-
-        try:
-            proc = subprocess.run(cmd, cwd=sandbox, env=env,
-                                  capture_output=True, text=True, timeout=self.timeout)
-        except subprocess.TimeoutExpired:
-            return ({"total": 0, "passed": 0, "failed": 0, "summary": "pytest 执行超时", "raw": ""},
-                    {"line": -1, "branch": -1, "function": -1, "available": coverage_available})
-
-        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-
-        passed = failed = 0
-        m = re.search(r"(\d+)\s+passed", output)
+    @staticmethod
+    def _strip_code_fences(code: str) -> str:
+        code = (code or "").strip()
+        m = re.search(r"```(?:python|py)?\s*\n(.*?)```", code, re.DOTALL)
         if m:
-            passed = int(m.group(1))
-        m = re.search(r"(\d+)\s+failed", output)
-        if m:
-            failed = int(m.group(1))
-        m = re.search(r"(\d+)\s+error", output)
-        if m:
-            failed += int(m.group(1))
+            return m.group(1).strip()
+        return code
 
-        summary = f"{passed} passed, {failed} failed"
-        if "no tests ran" in output or (passed == 0 and failed == 0 and proc.returncode == 5):
-            summary = "未收集到测试用例"
+    @staticmethod
+    def _adversarial_invalid(combined: Dict[str, Any], base: Dict[str, Any]) -> bool:
+        """对抗测试文件本身无效（收集/导入错误）→ 返回 True，而非发现了真实 bug。
 
-        coverage = self._coverage_report(sandbox, env) if coverage_available else \
-            {"line": -1, "branch": -1, "function": -1, "available": False}
+        只有「基线没有、合并后新增」的 critical 收集类错误才判定为坏测试；
+        普通的断言失败（major）是真实 bug 信号，不在这里过滤。
+        """
+        def critical_descs(r):
+            return {b.get("description", "") for b in (r.get("bugs") or [])
+                    if b.get("severity") == "critical"}
 
-        return ({"total": passed + failed, "passed": passed, "failed": failed,
-                 "summary": summary, "raw": output, "returncode": proc.returncode},
-                coverage)
+        new_critical = critical_descs(combined) - critical_descs(base)
+        return any(("收集" in d) or ("导入" in d) or ("未收集到" in d) for d in new_critical)
 
-    def _coverage_report(self, sandbox: str, env: Dict[str, str]) -> Dict[str, Any]:
-        try:
-            r = subprocess.run([sys.executable, "-m", "coverage", "report", "-m"],
-                               cwd=sandbox, env=env, capture_output=True, text=True, timeout=30)
-            m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", r.stdout or "")
-            # 无数据（如没有测试跑起来）视为 0% 覆盖率，而非 -1（-1 会被当作"无法测量"而跳过门槛）
-            line = int(m.group(1)) if m else 0
-            return {"line": line, "branch": -1, "function": -1, "available": True}
-        except Exception as e:
-            return {"line": -1, "branch": -1, "function": -1, "available": True, "error": str(e)}
+    @staticmethod
+    def _split_adversarial(combined: Dict[str, Any]) -> Dict[str, Any]:
+        """把「对抗测试失败」从「作者测试失败」里拆出来。
 
-    # ------------------------------------------------------------------
-    # 冒烟测试：真实启动应用并探活
-    # ------------------------------------------------------------------
-    def _run_smoke_test(self, sandbox: str) -> Dict[str, Any]:
-        probe = '''
-import json, importlib
-from fastapi import FastAPI
+        对抗测试是 LLM 独立生成的 red-team 信号，可能因状态隔离、臆测未定义行为而误报。
+        因此：对抗失败仍保留在 bugs 里喂给 builder 修（能抓住 id 唯一性这类真 bug），
+        但 all_passed 只看「作者测试 + 冒烟」——对抗失败不硬性阻塞部署。
+        """
+        adv_path = "tests/test_adversarial.py"
+        adv_bugs = [b for b in combined.get("bugs", []) if (b.get("file_path") or "") == adv_path]
+        combined["adversarial_bugs"] = adv_bugs
 
-app = None
-for name in ("main", "app", "server"):
-    try:
-        mod = importlib.import_module(name)
-    except Exception:
-        continue
-    for attr in dir(mod):
-        obj = getattr(mod, attr)
-        if isinstance(obj, FastAPI):
-            app = obj
-            break
-    if app is not None:
-        break
-
-if app is None:
-    print(json.dumps({"error": "未找到 FastAPI 实例（main.py 需包含 app = FastAPI(...)）"}))
-else:
-    from fastapi.testclient import TestClient
-    client = TestClient(app)
-    out = {}
-    for path in ("/openapi.json", "/"):
-        try:
-            out[path] = client.get(path).status_code
-        except Exception as e:
-            out[path] = f"error:{e}"
-    print(json.dumps(out))
-'''
-        probe_path = os.path.join(sandbox, "_smoke_probe.py")
-        with open(probe_path, "w", encoding="utf-8") as f:
-            f.write(probe)
-
-        try:
-            proc = subprocess.run([sys.executable, probe_path], cwd=sandbox,
-                                  env=self._env(sandbox), capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            return {"passed": False, "detail": "冒烟测试超时"}
-
-        out = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        if proc.returncode != 0 or not out:
-            return {"passed": False, "detail": (stderr or "应用无法导入/启动")[:500]}
-
-        try:
-            result = json.loads(out)
-        except json.JSONDecodeError:
-            return {"passed": False, "detail": out[:500]}
-
-        if "error" in result:
-            return {"passed": False, "detail": result["error"][:500]}
-
-        openapi_status = result.get("/openapi.json")
-        passed = openapi_status == 200
-        detail = "应用真实启动成功，/openapi.json 返回 200" if passed else f"探活失败: {result}"
-        return {"passed": passed, "detail": detail}
-
-    # ------------------------------------------------------------------
-    # 从真实输出提取 Bug 和建议
-    # ------------------------------------------------------------------
-    def _extract_bugs(self, pytest_result: Dict[str, Any]) -> List[Dict[str, Any]]:
-        bugs = []
-        output = pytest_result.get("raw", "")
-
-        # 没有收集到任何测试 → critical（测试缺失，无法验证功能）
-        if pytest_result.get("passed", 0) == 0 and pytest_result.get("failed", 0) == 0:
-            bugs.append({
-                "id": "BUG-NOTESTS",
-                "severity": "critical",
-                "description": "未收集到任何测试用例（pytest 未发现 tests/test_api.py，MVP 可能漏生成测试文件）",
-                "file_path": "",
-                "steps_to_reproduce": "运行 pytest，确认存在 tests/test_api.py",
-            })
-
-        # 收集/导入错误 → critical（应用根本跑不起来）
-        for m in re.finditer(r"^ERROR (.+)$", output, re.MULTILINE):
-            bugs.append({
-                "id": f"BUG-{len(bugs) + 1}",
-                "severity": "critical",
-                "description": f"测试收集/导入错误: {m.group(1).strip()}",
-                "file_path": "",
-                "steps_to_reproduce": f"运行 pytest，见原始输出",
-            })
-
-        # 断言失败 → major
-        for m in re.finditer(r"^FAILED (.+?)(?: - (.+))?$", output, re.MULTILINE):
-            name = m.group(1).strip()
-            detail = (m.group(2) or "").strip()
-            bugs.append({
-                "id": f"BUG-{len(bugs) + 1}",
-                "severity": "major",
-                "description": f"测试失败: {name}" + (f" — {detail}" if detail else ""),
-                "file_path": name.split("::")[0],
-                "steps_to_reproduce": f"运行 pytest {name}",
-            })
-
-        # 有失败但没解析到具体条目（如非标准输出）
-        if pytest_result.get("failed", 0) > 0 and not bugs:
-            bugs.append({
-                "id": "BUG-1",
-                "severity": "major",
-                "description": f"{pytest_result.get('failed', 0)} 个测试失败（见原始输出）",
-                "file_path": "",
-                "steps_to_reproduce": "运行 pytest",
-            })
-
-        return bugs
-
-    def _extract_suggestions(self, pytest_result: Dict[str, Any], bugs: List[Dict]) -> List[str]:
-        suggestions = []
-        if bugs:
-            suggestions.append("修复所有失败的测试，重点看原始输出的 traceback 定位问题")
-        if pytest_result.get("returncode") not in (0, None):
-            suggestions.append(f"pytest 返回码 {pytest_result.get('returncode')}，请修复后重新验证")
-        return suggestions
+        # 重算 all_passed：作者测试失败数 = 总失败数 - 对抗失败数（每个 FAILED 行对应一个测试）
+        author_failed = max(0, combined.get("failed", 0) - len(adv_bugs))
+        no_tests = combined.get("passed", 0) == 0 and author_failed == 0
+        combined["all_passed"] = (
+            author_failed == 0
+            and not no_tests
+            and (combined.get("smoke_test") or {}).get("passed", False)
+        )
+        return combined

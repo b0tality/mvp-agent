@@ -1,6 +1,7 @@
 """
 验收测试Agent —— 把验收标准（考卷）转成可执行 pytest 并真实运行
 
+具体执行逻辑委托给 tools.executors.run_acceptance（与 function-calling 工具共享同一实现）。
 核心作用：需求阶段产出的 acceptance_criteria 是「考卷」，本 agent 在代码生成后，
 把考卷逐条转成真实可跑的测试，核对「需求说返回 400，代码到底是不是 400」。
 
@@ -9,17 +10,13 @@
 - 验收测试由验收标准驱动，严格按需求断言，代码错了就必须让它失败。
 """
 
-import os
 import re
-import sys
 import time
-import shutil
-import tempfile
-import subprocess
 from typing import Dict, Any, List
 
 from agents.base import BaseAgent, AgentResult
 from llm.adapter import LLMAdapter
+from tools.executors import run_acceptance
 
 
 class AcceptanceAgent(BaseAgent):
@@ -56,21 +53,29 @@ class AcceptanceAgent(BaseAgent):
         start = time.time()
         try:
             test_code = await self._generate_acceptance_tests(criteria, code_files, api_design)
-            data = self._run_acceptance_tests(criteria, code_files, test_code)
+            data = await run_acceptance(criteria, code_files, test_code, timeout=self.timeout)
+            # UI 验收盲区检测：验收标准描述 UI 行为，但代码没实现前端 → 显式告警
+            warnings = self._detect_ui_gap(criteria, code_files)
+            if warnings:
+                data["warnings"] = warnings
             return self._success(data, time.time() - start)
         except Exception as e:
             return self._error(str(e), time.time() - start)
 
     # ------------------------------------------------------------------
-    # 生成验收测试
+    # 生成验收测试（这部分需要 LLM）
     # ------------------------------------------------------------------
     async def _generate_acceptance_tests(self, criteria, code_files, api_design) -> str:
         system = """你是一位严格的验收测试工程师。请把「验收标准」逐条转成可执行的 pytest 测试。
 
 要求：
 1. 每个验收标准生成一个测试函数，函数名必须是 test_ac_<criterion_id>，其中 criterion_id 里的非字母数字字符替换为下划线（如 AC-001 → test_ac_AC_001）。
-2. 测试从主模块 import FastAPI 实例（通常 `from main import app`），用 httpx 打真实接口：
-   transport = ASGITransport(app=app) 然后 async with AsyncClient(transport=transport, base_url="http://test") as client。
+2. 测试用**同步**写法，文件顶部固定：
+   from fastapi.testclient import TestClient
+   from main import app
+   client = TestClient(app)
+   然后每个测试直接 `resp = client.post(path, json={...})` / `client.get(path)` 同步调用断言。
+   **禁止 async def、禁止 AsyncClient/ASGITransport、禁止 async with**——同步 TestClient 对异步 FastAPI 同样可用，且不会出现「client 已关闭」的生命周期问题。
 3. 严格按验收标准里写明的期望来断言（状态码、返回内容），不要迁就代码的实际行为——代码错了就必须让它测失败。
 4. 根据 api_design 和代码确定正确的 method、path、请求体字段名。
 5. 只测验收标准明确要求的行为，不额外发挥。
@@ -95,98 +100,42 @@ API设计：
         return code
 
     # ------------------------------------------------------------------
-    # 执行验收测试
+    # UI 验收盲区检测
     # ------------------------------------------------------------------
-    def _run_acceptance_tests(self, criteria, code_files, test_code) -> Dict[str, Any]:
-        sandbox = tempfile.mkdtemp(prefix="magent_accept_")
-        try:
-            self._write_files(sandbox, code_files)
-            test_path = os.path.join(sandbox, "test_acceptance.py")
-            with open(test_path, "w", encoding="utf-8") as f:
-                f.write(test_code)
+    _UI_KEYWORDS = [
+        "界面", "按钮", "点击", "复选框", "页面", "视觉", "前端", "输入框",
+        "浏览器", "表单", "下拉", "弹窗", "视图", "显示在", "导航",
+    ]
 
-            env = dict(os.environ)
-            env["PYTHONPATH"] = sandbox + os.pathsep + env.get("PYTHONPATH", "")
-            env["PYTHONIOENCODING"] = "utf-8"
+    @classmethod
+    def _is_ui_criterion(cls, description: str) -> bool:
+        d = (description or "").lower()
+        return any(k in d for k in cls._UI_KEYWORDS)
 
-            try:
-                proc = subprocess.run(
-                    [sys.executable, "-m", "pytest", "-v", "--tb=line", "-p", "no:cacheprovider"],
-                    cwd=sandbox, env=env, capture_output=True, text=True, timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired:
-                return self._build_failed(criteria, "验收测试执行超时", "")
+    @staticmethod
+    def _has_frontend(code_files: List[Dict]) -> bool:
+        for cf in code_files:
+            path = (cf.get("path") or "").lower()
+            content = (cf.get("content") or "") or ""
+            if path.endswith((".html", ".js", ".css", ".vue", ".jsx", ".tsx")):
+                return True
+            low = content.lower()
+            if "staticfiles" in low or "htmlresponse" in low or "<html" in low or "<script" in low:
+                return True
+        return False
 
-            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            return self._parse_results(criteria, output)
-        finally:
-            shutil.rmtree(sandbox, ignore_errors=True)
-
-    def _parse_results(self, criteria, output) -> Dict[str, Any]:
-        results = []
-        for i, c in enumerate(criteria):
-            cid = str(c.get("id") or "")
-            sanitized = re.sub(r"[^0-9a-zA-Z_]", "_", cid) or f"criterion_{i + 1}"
-            test_name = f"test_ac_{sanitized}"
-
-            # 用 `::` 锚定 + 要求函数名后紧跟空白，避免前缀误匹配：
-            # 如 AC-001 不能匹配到 AC-001_ERROR_EMPTY_TITLE（后者 FAILED 会污染前者）
-            m = re.search(rf"::{re.escape(test_name)}\s+(PASSED|FAILED|ERROR)", output)
-            status = m.group(1) if m else None
-
-            if status is None:
-                passed = False
-                if "error" in output.lower() or "ERROR" in output:
-                    detail = "验收测试收集/运行失败（见原始输出）"
-                else:
-                    detail = "未生成对应验收测试"
-            else:
-                passed = status == "PASSED"
-                detail = {
-                    "PASSED": "验收通过",
-                    "FAILED": "验收失败（代码行为不符合需求）",
-                    "ERROR": "验收测试运行错误",
-                }[status]
-
-            results.append({
-                "criterion_id": cid,
-                "description": c.get("description", ""),
-                "passed": passed,
-                "detail": detail,
-            })
-
-        passed = sum(1 for r in results if r["passed"])
-        failed = len(results) - passed
-        return {
-            "results": results,
-            "total": len(results),
-            "passed": passed,
-            "failed": failed,
-            "all_passed": failed == 0,
-            "raw_output": output,
-        }
-
-    def _build_failed(self, criteria, detail, output) -> Dict[str, Any]:
-        results = [{
-            "criterion_id": c.get("id", ""),
-            "description": c.get("description", ""),
-            "passed": False, "detail": detail,
-        } for c in criteria]
-        return {
-            "results": results, "total": len(criteria), "passed": 0,
-            "failed": len(criteria), "all_passed": False, "raw_output": output,
-        }
-
-    def _write_files(self, sandbox: str, files: List[Dict]) -> None:
-        for f in files:
-            path = (f.get("path") or "").strip().lstrip("/\\")
-            content = f.get("content") or ""
-            if not path or not content:
-                continue
-            clean = os.path.normpath(path)
-            if clean.startswith("..") or os.path.isabs(clean):
-                continue
-            dest = os.path.join(sandbox, clean)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(content)
+    @classmethod
+    def _detect_ui_gap(cls, criteria: List[Dict], code_files: List[Dict]) -> List[Dict]:
+        """若验收标准描述 UI 行为但代码无前端，返回告警（否则验收会形同虚设：UI 标准被映射成 API 测试）。"""
+        ui_criteria = [c for c in criteria if cls._is_ui_criterion(c.get("description", ""))]
+        if not ui_criteria or cls._has_frontend(code_files):
+            return []
+        return [{
+            "type": "ui_api_gap",
+            "message": (
+                f"验收标准 {len(ui_criteria)} 条描述 UI 行为（界面/按钮/点击等），"
+                "但代码未实现前端（无 html/js/StaticFiles），验收测试被映射为 API 测试，"
+                "UI 需求实际未得到验证"
+            ),
+            "criterion_ids": [c.get("id", "") for c in ui_criteria],
+        }]
