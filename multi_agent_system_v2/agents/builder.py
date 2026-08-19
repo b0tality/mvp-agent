@@ -69,13 +69,28 @@ class BuilderAgent(BaseAgent):
             self.last_tests = {}
 
             iterating = bool(feedback and current_code)
+            system_prompt = self._system_prompt(iterating=iterating, spec_mode=self._spec_mode)
+            user_prompt = self._user_prompt(user_input, requirements, technical_solution, feedback, iteration, spec=spec)
+
             final_text = await self.llm.generate_with_tools(
-                self._system_prompt(iterating=iterating, spec_mode=self._spec_mode),
-                self._user_prompt(user_input, requirements, technical_solution, feedback, iteration, spec=spec),
-                self._tool_schemas(),
-                self._build_handlers(),
+                system_prompt, user_prompt, self._tool_schemas(), self._build_handlers(),
                 max_rounds=self.max_rounds,
             )
+
+            # 兜底：LLM（尤其 DeepSeek 面对嵌套/长契约）偶发只吐文字不调 write_code，
+            # 导致工作区零产出（实测 order_line_items 复跑时出现过）。重试一次并明确勒令
+            # 调用 write_code，把「偶发空产出」降级为可自愈，而非直接判失败。
+            if not self.code_files:
+                retry_user = user_prompt + (
+                    "\n\n【重要提醒】上一轮你没有调用 write_code 工具，工作区仍然是空的。"
+                    "请立刻调用 write_code 工具把代码写入工作区（至少 main.py），"
+                    "实现契约里的每一个端点，然后调 verify_code / run_tests 验证。"
+                    "不要只输出文字说明——必须实际调用工具。"
+                )
+                final_text = await self.llm.generate_with_tools(
+                    system_prompt, retry_user, self._tool_schemas(), self._build_handlers(),
+                    max_rounds=self.max_rounds,
+                )
 
             if not self.code_files:
                 return self._error("Builder 未产出任何代码（LLM 未调用 write_code）", time.time() - start)
