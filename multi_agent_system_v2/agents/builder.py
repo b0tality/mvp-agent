@@ -41,6 +41,7 @@ class BuilderAgent(BaseAgent):
         self.project_name: str = ""
         self.last_verify: Dict[str, Any] = {}
         self.last_tests: Dict[str, Any] = {}
+        self._spec_mode: bool = False
 
     async def execute(self, **kwargs) -> AgentResult:
         user_input = kwargs.get("user_input", "")
@@ -51,23 +52,26 @@ class BuilderAgent(BaseAgent):
         current_test_files = kwargs.get("current_test_files") or []
         project_name = kwargs.get("project_name", "")
         iteration = kwargs.get("iteration", 0)
+        spec = kwargs.get("spec")
+        seed_tests = kwargs.get("seed_tests") or []
 
-        if not user_input and not technical_solution:
-            return self._error("缺少 user_input 或 technical_solution 参数")
+        if not user_input and not technical_solution and not spec:
+            return self._error("缺少 user_input / technical_solution / spec 参数")
 
         start = time.time()
         try:
             # 重置状态；迭代模式（feedback + 上一版代码）则从现有代码起跑，定点修复而非从零重写
+            self._spec_mode = bool(spec)
             self.code_files = list(current_code)
-            self.test_files = list(current_test_files)
-            self.project_name = project_name
+            self.test_files = list(seed_tests) if self._spec_mode else list(current_test_files)
+            self.project_name = project_name or (spec.get("project_name", "") if isinstance(spec, dict) else "")
             self.last_verify = {}
             self.last_tests = {}
 
-            iterating = bool(feedback and current_code)
+            iterating = bool(feedback and current_code) and not self._spec_mode
             final_text = await self.llm.generate_with_tools(
-                self._system_prompt(iterating=iterating),
-                self._user_prompt(user_input, requirements, technical_solution, feedback, iteration),
+                self._system_prompt(iterating=iterating, spec_mode=self._spec_mode),
+                self._user_prompt(user_input, requirements, technical_solution, feedback, iteration, spec=spec),
                 self._tool_schemas(),
                 self._build_handlers(),
                 max_rounds=self.max_rounds,
@@ -97,7 +101,8 @@ class BuilderAgent(BaseAgent):
             # 已 seed 的测试文件不会被清空。
             if "code_files" in args:
                 self.code_files = args.get("code_files") or []
-            if "test_files" in args:
+            # spec 模式下测试由系统确定性生成，忽略 LLM 传的 test_files，避免覆盖 seed 的验收测试
+            if not self._spec_mode and "test_files" in args:
                 self.test_files = args.get("test_files") or []
             if args.get("project_name"):
                 self.project_name = args["project_name"]
@@ -115,7 +120,14 @@ class BuilderAgent(BaseAgent):
             r = await run_tests(self.code_files, self.test_files)
             # 截断原始输出，避免 traceback 撑爆回灌上下文
             r = dict(r)
-            r["raw_output"] = (r.get("raw_output") or "")[:4000]
+            raw = (r.get("raw_output") or "")[:4000]
+            # 环境自愈兜底装上的依赖：代码 import 了它但 requirements.txt 没写——
+            # 显式提醒 LLM 补齐 requirements，否则部署产物会缺依赖。
+            auto = r.get("auto_installed") or []
+            if auto:
+                raw = (f"[环境自愈] 执行时自动补装了缺失依赖: {', '.join(auto)}。"
+                       f"请确认 requirements.txt 已包含这些包，否则部署会缺依赖。\n\n") + raw
+            r["raw_output"] = raw
             self.last_tests = r
             return r
 
@@ -169,7 +181,29 @@ class BuilderAgent(BaseAgent):
     # prompt
     # ------------------------------------------------------------------
     @staticmethod
-    def _system_prompt(iterating: bool = False) -> str:
+    def _system_prompt(iterating: bool = False, spec_mode: bool = False) -> str:
+        if spec_mode:
+            return """你是一位资深后端工程师。你的任务是**只写代码**，实现一份给定的 API 契约（spec），
+使系统为你生成的测试全部通过。
+
+工作区工具：
+- write_code：写入代码文件（**只写代码，不写测试**）。
+- verify_code：编译/语法检查。
+- run_tests：真实运行系统已生成好的测试套件（pytest + 覆盖率 + 冒烟）。
+
+工作流程（用工具自主推进，不要问问题）：
+1. 先 write_code 写入 main.py（必要时加辅助模块），实现 spec 里**每一个**端点与规则。
+2. 调 verify_code 检查编译；有错误就定点修复。
+3. 调 run_tests 看测试结果；有失败就根据 traceback 定点修，只改有问题的部分。
+4. 重复直到 run_tests 返回 all_passed=true，然后停（只给一句简短总结）。
+
+硬性要求：
+- 后端用 FastAPI，主入口 main.py 且包含 `app = FastAPI(...)`。
+- **精确实现 spec 的端点路径/方法/状态码**，不要偏离、不要增删端点（契约校验会抓偏离）。
+- 功能真实实现，不能是 TODO 占位。
+- 代码语法正确、可编译、可运行。
+- 不要写测试文件——测试已由系统从 spec 确定性生成，你写的会被忽略。"""
+
         base = """你是一位资深全栈开发工程师。目标是产出一个「编译通过 + 测试全过」的可运行 FastAPI MVP。
 
 你有一个工作区，通过调用工具操作它：
@@ -208,7 +242,15 @@ class BuilderAgent(BaseAgent):
         technical_solution: Dict,
         feedback: Dict = None,
         iteration: int = 0,
+        spec: Dict = None,
     ) -> str:
+        if spec:
+            # spec 模式：只喂契约，LLM 的唯一目标是实现它
+            import json as _json
+            return (
+                "API 契约（spec，必须精确实现每一个端点与规则）：\n"
+                + _json.dumps(spec, ensure_ascii=False, indent=2)
+            )
         parts = []
         if iteration:
             parts.append(f"【第 {iteration} 次修复迭代】")

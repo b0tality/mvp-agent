@@ -151,6 +151,16 @@ def _find_delete_path(schema: Dict, post_path: str) -> Optional[str]:
     return None
 
 
+def _has_get_at(schema: Dict, path: str) -> bool:
+    """该路径上是否有 GET 端点——「删除后 GET → 404」这个不变式需要 GET 才可验证。
+
+    若 spec 只要求 DELETE 而不要求按 id 读取（合法设计），DELETE 后再 GET 会得到 405
+    而非 404，这时「删除后 404」不变式无法客观判定，必须跳过（宁可少测，不误报）。
+    """
+    methods = schema.get("paths", {}).get(path, {})
+    return isinstance(methods, dict) and "get" in methods
+
+
 def _find_get_list(schema: Dict, path: str) -> bool:
     """POST 路径上是否有一个返回数组（列表）的 GET——这是「集合资源」的判据。
 
@@ -250,8 +260,8 @@ def generate_invariant_tests(code_files: List[Dict]) -> str:
     after = len(client.get({path!r}).json())
     assert after == before + 1''')
 
-    # 3. 删除后 404（仅当存在对应 DELETE 端点，且路径参数名可解析）
-    if delete_path:
+    # 3. 删除后 404（仅当存在对应 DELETE 端点、有同路径 GET 可验证 404，且路径参数名可解析）
+    if delete_path and _has_get_at(schema, delete_path):
         m = __import__("re").search(r"/\{([^}/]+)\}", delete_path)
         if m:
             param = m.group(1)

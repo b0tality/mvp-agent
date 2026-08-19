@@ -14,6 +14,7 @@ import asyncio
 sys.path.insert(0, r'C:\Users\MECHREV\agent\multi_agent_system_v2')
 
 from tools.executors import verify_code, run_tests, run_acceptance
+from tools import executors
 from agents.testing import TestingAgent
 
 
@@ -57,7 +58,57 @@ BROKEN_PY = {
 }
 
 
+def test_extract_missing_third_party():
+    """缺依赖识别：只认 ModuleNotFoundError 的三方包，排除 stdlib / 本地模块 / ImportError。"""
+    # 缺三方依赖 → 提出来补装
+    out = "E   ModuleNotFoundError: No module named 'passlib'\n"
+    assert executors._extract_missing_third_party(out, [{"path": "main.py"}]) == ["passlib"], "应识别 passlib"
+    # 本地模块（mymodule.py 是生成代码）→ 不误报为缺依赖
+    out = "E   ModuleNotFoundError: No module named 'mymodule'\n"
+    assert executors._extract_missing_third_party(out, [{"path": "mymodule.py"}]) == [], "本地模块不应误报"
+    # stdlib → 不误报
+    out = "E   ModuleNotFoundError: No module named 'os'\n"
+    assert executors._extract_missing_third_party(out, []) == [], "stdlib 不应误报"
+    # ImportError cannot import name 是代码级导入 bug，不是缺依赖
+    out = "E   ImportError: cannot import name 'foo' from 'bar'\n"
+    assert executors._extract_missing_third_party(out, []) == [], "ImportError 不是缺依赖"
+
+
+def test_root_cause_extraction():
+    out = "E   ModuleNotFoundError: No module named 'passlib'\n"
+    assert executors._root_cause(out) == "ModuleNotFoundError: No module named 'passlib'"
+    assert executors._root_cause("1 passed\n") == ""
+
+
+def test_self_heal_loop_reinstalls():
+    """环境自愈：首跑缺依赖 → 补装 → 重跑，installed 记录补装包名，final_deps 指向新缓存。"""
+    calls = {"n": 0}
+
+    def fake_run(deps):
+        calls["n"] += 1
+        return {"raw": "ModuleNotFoundError: No module named 'passlib'"} if calls["n"] == 1 \
+            else {"raw": "1 passed"}
+
+    real_install = executors.install_packages
+    executors.install_packages = lambda pkgs: "/fake/deps"
+    try:
+        result, final_deps, installed = executors._self_heal_loop(
+            "/sandbox", 120, None, [{"path": "main.py"}], fake_run,
+        )
+    finally:
+        executors.install_packages = real_install
+
+    assert calls["n"] == 2, f"应重跑一次，实际跑 {calls['n']} 次"
+    assert installed == ["passlib"], installed
+    assert result["raw"] == "1 passed"
+    assert final_deps == "/fake/deps", final_deps
+
+
 async def main():
+    test_extract_missing_third_party()
+    test_root_cause_extraction()
+    test_self_heal_loop_reinstalls()
+
     # 1) verify_code：正确代码通过
     r = await verify_code([MAIN_PY, TEST_API_PY])
     assert r["passed"] is True, f"valid code should pass, got {r}"

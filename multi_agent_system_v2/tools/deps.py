@@ -77,3 +77,46 @@ def ensure_deps(code_files: List[Dict], timeout: int = 180) -> Optional[str]:
             f.write("ok\n")
 
     return target if os.path.isdir(target) else None
+
+
+# import 名 → pip 包名 不一致的常见映射（import jwt → PyJWT 等）
+_IMPORT_TO_PIP = {
+    "jwt": "PyJWT",
+    "cv2": "opencv-python-headless",
+    "PIL": "Pillow",
+    "sklearn": "scikit-learn",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "dotenv": "python-dotenv",
+    "attr": "attrs",
+}
+
+
+def install_packages(packages: List[str], timeout: int = 180) -> Optional[str]:
+    """安装一组明确的包名到共享缓存（用于环境自愈），返回缓存目录；失败返回 None。
+
+    与 ensure_deps 的区别：这里按「包名列表」直接 pip install，而不是读 requirements.txt。
+    供 run_tests/run_acceptance 在检测到 `ModuleNotFoundError` 后补装缺失依赖时调用。
+    """
+    if not packages:
+        return None
+
+    pkgs = sorted({_IMPORT_TO_PIP.get(p, p) for p in packages})
+    key = "pkg_" + hashlib.sha256("\n".join(pkgs).encode("utf-8")).hexdigest()[:16]
+    target = os.path.join(_CACHE_ROOT, key)
+    done = os.path.join(target, ".done")
+
+    if not os.path.isfile(done):
+        os.makedirs(target, exist_ok=True)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install",
+                 "--quiet", "--disable-pip-version-check", "--target", target] + pkgs,
+                capture_output=True, text=True, timeout=timeout, check=True,
+            )
+        except Exception:
+            return None
+        with open(done, "w", encoding="utf-8") as f:
+            f.write("ok\n")
+
+    return target if os.path.isdir(target) else None

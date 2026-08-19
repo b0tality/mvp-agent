@@ -33,6 +33,7 @@ from .deployment import (
     DeploymentOutput,
 )
 from .pipeline import StageResult, PipelineResult
+from .spec import ProjectSpec, EndpointSpec, RuleSpec
 
 __all__ = [
     # Requirements
@@ -75,4 +76,8 @@ __all__ = [
     # Pipeline
     "StageResult",
     "PipelineResult",
+    # Spec
+    "ProjectSpec",
+    "EndpointSpec",
+    "RuleSpec",
 ]

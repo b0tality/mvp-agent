@@ -141,9 +141,58 @@ def test_invariant_passes_fixed_code():
     assert data["all_passed"] is True, data
 
 
+DELETE_ONLY_MAIN = {
+    "path": "main.py", "language": "python",
+    "content": '''from fastapi import FastAPI
+from pydantic import BaseModel
+
+app = FastAPI()
+todos = []
+next_id = 1
+
+class TodoCreate(BaseModel):
+    title: str
+
+class TodoResponse(BaseModel):
+    id: int
+    title: str
+
+@app.post("/todos", status_code=201, response_model=TodoResponse)
+def create(todo: TodoCreate):
+    global next_id
+    todos.append({"id": next_id, "title": todo.title})
+    next_id += 1
+    return todos[-1]
+
+@app.get("/todos", response_model=list[TodoResponse])
+def list_todos():
+    return todos
+
+@app.delete("/todos/{id}", status_code=204)
+def delete_todo(id: int):
+    global todos
+    todos = [t for t in todos if t["id"] != id]
+    return None
+''',
+}
+
+
+def test_invariant_skips_delete_404_when_no_get_by_id():
+    """只有 DELETE /todos/{id} 而无 GET /todos/{id} 时，「删除后 GET → 404」不可验证。
+
+    此时 GET /todos/{id} 会返回 405 而非 404，属误报。生成器应跳过 delete_then_404，
+    只保留 id 唯一 / 计数一致这两条可客观判定的不变式（宁可少测，不误报）。
+    """
+    inv = generate_invariant_tests([DELETE_ONLY_MAIN])
+    assert "test_invariant_id_unique" in inv, inv
+    assert "test_invariant_count_consistent" in inv, inv
+    assert "test_invariant_delete_then_404" not in inv, inv
+
+
 if __name__ == "__main__":
     test_generator_derives_id_unique_without_llm()
     test_invariant_catches_id_bug()
     test_invariant_passes_fixed_code()
     test_invariant_skips_non_collection_resource()
-    print("[PASS] 确定性不变式测试: 从 OpenAPI 机械推导 + 抓到 next_id bug + 修复后通过 + auth 端点跳过")
+    test_invariant_skips_delete_404_when_no_get_by_id()
+    print("[PASS] 确定性不变式测试: 从 OpenAPI 机械推导 + 抓到 next_id bug + 修复后通过 + auth 端点跳过 + 无 GET-by-id 跳过 delete_404")

@@ -22,7 +22,18 @@ import subprocess
 import importlib.util
 from typing import Dict, Any, List
 
-from tools.deps import ensure_deps
+from tools.deps import ensure_deps, install_packages
+
+# Python 3.10+ 提供；老版本回退空集（此时 stdlib 误判只会多一次 pip 尝试，无副作用）
+_STDLIB_MODULES = set(getattr(sys, "stdlib_module_names", ()))
+
+# 执行环境常带 FORCE_COLOR/COLORTERM，pytest 输出会夹 ANSI 转义码，破坏 `^E`/`^ERROR`
+# 这类行首锚定的正则解析。统一剥掉，保证原始输出可被确定性解析。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
 
 
 # ----------------------------------------------------------------------
@@ -154,8 +165,10 @@ async def run_tests(
         _write_pytest_ini(sandbox)
 
         deps = ensure_deps(code_files)
-        pytest_result, coverage = _run_pytest_with_coverage(sandbox, timeout, deps)
-        smoke = _run_smoke_test(sandbox, deps)
+        pytest_result, coverage, final_deps, auto_installed = _run_pytest_with_self_heal(
+            sandbox, timeout, deps, code_files
+        )
+        smoke = _run_smoke_test(sandbox, final_deps)
         bugs = _extract_bugs(pytest_result)
 
         # 至少要有测试真实跑起来并全部通过才算 all_passed（0 个测试不算通过）
@@ -166,6 +179,7 @@ async def run_tests(
         return {
             "test_cases": [],
             "coverage": coverage,
+            "auto_installed": auto_installed,
             "bugs": bugs,
             "total_tests": pytest_result["total"],
             "passed": pytest_result["passed"],
@@ -178,6 +192,78 @@ async def run_tests(
         }
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def _local_module_stems(code_files: List[Dict]) -> set:
+    """生成代码里本地 .py 文件的模块名（用于区分「缺依赖」和「本地模块缺失」）。"""
+    stems = set()
+    for cf in code_files:
+        p = (cf.get("path") or "").replace("\\", "/").rstrip("/")
+        if p.endswith(".py"):
+            stems.add(os.path.splitext(os.path.basename(p))[0])
+    return stems
+
+
+def _extract_missing_third_party(output: str, code_files: List[Dict]) -> List[str]:
+    """从 pytest 输出提取「缺失的三方依赖」顶层模块名（排除 stdlib 和本地代码模块）。
+
+    只认 ModuleNotFoundError（缺包）；ImportError「cannot import name」是代码级导入 bug，
+    不在这里处理——那需要改代码，不是装包能解决的。
+    """
+    found = set()
+    for m in re.finditer(r"ModuleNotFoundError: No module named '([^']+)'", output or ""):
+        found.add(m.group(1).split(".")[0])
+    local = _local_module_stems(code_files)
+    return sorted({
+        mod for mod in found
+        if mod and mod != "__main__" and mod not in _STDLIB_MODULES and mod not in local
+    })
+
+
+def _self_heal_loop(
+    sandbox: str, timeout: int, deps: str, code_files: List[Dict],
+    run_once, max_heal: int = 3,
+):
+    """环境自愈主循环：run_once(deps) → 检测缺失三方依赖 → 补装 → 重跑。
+
+    run_once 是「用给定 PYTHONPATH 前缀跑一次测试并返回含 'raw' 字段的 dict」的可调用。
+    返回 (result, final_deps, installed)。final_deps 是合并了自愈补装目录后的 PYTHONPATH
+    前缀（冒烟/验收都要用它，否则会因缺依赖再次失败）；installed 是这次补装的包名。
+    """
+    result = run_once(deps)
+    current_deps = deps
+    installed: List[str] = []
+    for _ in range(max_heal):
+        missing = _extract_missing_third_party(result.get("raw", ""), code_files)
+        if not missing:
+            break
+        extra = install_packages(missing)
+        if not extra:
+            break  # 装不上（无网络/包名错），退回现状，别再空转
+        installed.extend(missing)
+        current_deps = os.pathsep.join([p for p in (extra, current_deps) if p])
+        result = run_once(current_deps)
+    return result, current_deps, installed
+
+
+def _run_pytest_with_self_heal(
+    sandbox: str, timeout: int, deps: str, code_files: List[Dict], max_heal: int = 3,
+):
+    """跑 pytest + coverage，检测到缺失三方依赖就自动补装并重跑（环境自愈）。
+
+    返回 (pytest_result, coverage, final_deps, installed)。final_deps 是合并了自愈补装
+    目录后的 PYTHONPATH 前缀（冒烟探活也要用它，否则冒烟会因缺依赖再次失败）。
+    """
+    result, final_deps, installed = _self_heal_loop(
+        sandbox, timeout, deps, code_files,
+        lambda d: _run_pytest_with_coverage(sandbox, timeout, d)[0],
+        max_heal=max_heal,
+    )
+    # coverage 由最后一次 coverage run 写入 .coverage，这里补读最终报告
+    coverage = _coverage_report(sandbox, _env(sandbox, final_deps)) \
+        if importlib.util.find_spec("coverage") is not None else \
+        {"line": -1, "branch": -1, "function": -1, "available": False}
+    return result, coverage, final_deps, installed
 
 
 def _run_pytest_with_coverage(sandbox: str, timeout: int, deps: str = None):
@@ -198,7 +284,7 @@ def _run_pytest_with_coverage(sandbox: str, timeout: int, deps: str = None):
         return ({"total": 0, "passed": 0, "failed": 0, "summary": "pytest 执行超时", "raw": ""},
                 {"line": -1, "branch": -1, "function": -1, "available": coverage_available})
 
-    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    output = _strip_ansi((proc.stdout or "") + "\n" + (proc.stderr or ""))
 
     passed = failed = 0
     m = re.search(r"(\d+)\s+passed", output)
@@ -227,7 +313,7 @@ def _coverage_report(sandbox: str, env: Dict[str, str]) -> Dict[str, Any]:
     try:
         r = subprocess.run([sys.executable, "-m", "coverage", "report", "-m"],
                            cwd=sandbox, env=env, capture_output=True, text=True, timeout=30)
-        m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", r.stdout or "")
+        m = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", _strip_ansi(r.stdout or ""))
         line = int(m.group(1)) if m else 0
         return {"line": line, "branch": -1, "function": -1, "available": True}
     except Exception as e:
@@ -295,24 +381,42 @@ else:
     return {"passed": passed, "detail": detail}
 
 
+def _root_cause(output: str) -> str:
+    """从 pytest 短 traceback 里抓最可能的一行根因（`E   <异常>: <消息>`）。
+
+    这行通常直接点出「缺依赖」还是「代码 import 错」——正是喂给 builder 判定
+    「该补 requirements 还是改代码」的关键信号。
+    """
+    for m in re.finditer(r"^E\s+(\S[^:]*):\s*(.+)$", output, re.MULTILINE):
+        return f"{m.group(1)}: {m.group(2).strip()}"
+    return ""
+
+
 def _extract_bugs(pytest_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     bugs = []
     output = pytest_result.get("raw", "")
+    root = _root_cause(output)
 
     if pytest_result.get("passed", 0) == 0 and pytest_result.get("failed", 0) == 0:
+        desc = "未收集到任何测试用例（pytest 未发现 tests/test_api.py，MVP 可能漏生成测试文件）"
+        if root:
+            desc += f"（根因: {root}）"
         bugs.append({
             "id": "BUG-NOTESTS",
             "severity": "critical",
-            "description": "未收集到任何测试用例（pytest 未发现 tests/test_api.py，MVP 可能漏生成测试文件）",
+            "description": desc,
             "file_path": "",
             "steps_to_reproduce": "运行 pytest，确认存在 tests/test_api.py",
         })
 
     for m in re.finditer(r"^ERROR (.+)$", output, re.MULTILINE):
+        desc = f"测试收集/导入错误: {m.group(1).strip()}"
+        if root:
+            desc += f"（根因: {root}）"
         bugs.append({
             "id": f"BUG-{len(bugs) + 1}",
             "severity": "critical",
-            "description": f"测试收集/导入错误: {m.group(1).strip()}",
+            "description": desc,
             "file_path": "",
             "steps_to_reproduce": "运行 pytest，见原始输出",
         })
@@ -352,13 +456,30 @@ def _extract_suggestions(pytest_result: Dict[str, Any], bugs: List[Dict]) -> Lis
 # ----------------------------------------------------------------------
 # run_acceptance：运行验收 pytest
 # ----------------------------------------------------------------------
+def _run_acceptance_pytest(sandbox: str, timeout: int, deps: str) -> Dict[str, Any]:
+    """跑验收 pytest（-v --tb=line，逐条核对），返回 {'raw', 'returncode'} 或超时标记。"""
+    env = _env(sandbox, deps)
+    cmd = [sys.executable, "-m", "pytest", "-v", "--tb=line", "--color=no",
+           "-p", "no:cacheprovider"]
+    try:
+        proc = subprocess.run(cmd, cwd=sandbox, env=env,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"raw": "", "timed_out": True}
+    output = _strip_ansi((proc.stdout or "") + "\n" + (proc.stderr or ""))
+    return {"raw": output, "returncode": proc.returncode}
+
+
 async def run_acceptance(
     criteria: List[Dict],
     code_files: List[Dict],
     test_code: str,
     timeout: int = 120,
 ) -> Dict[str, Any]:
-    """把验收 pytest 代码写入沙箱并真实运行，逐条核对验收标准。"""
+    """把验收 pytest 代码写入沙箱并真实运行，逐条核对验收标准。
+
+    与 run_tests 一样走环境自愈：验收测试也会 import main.py，缺三方依赖时先补装再重跑。
+    """
     sandbox = tempfile.mkdtemp(prefix="magent_accept_")
     try:
         _write_files(sandbox, code_files)
@@ -368,17 +489,16 @@ async def run_acceptance(
             f.write(test_code)
 
         deps = ensure_deps(code_files)
-        env = _env(sandbox, deps)
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "pytest", "-v", "--tb=line", "--color=no", "-p", "no:cacheprovider"],
-                cwd=sandbox, env=env, capture_output=True, text=True, timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
+        result, _final_deps, auto_installed = _self_heal_loop(
+            sandbox, timeout, deps, code_files,
+            lambda d: _run_acceptance_pytest(sandbox, timeout, d),
+        )
+        if result.get("timed_out"):
             return _build_failed(criteria, "验收测试执行超时", "")
 
-        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        return _parse_results(criteria, output)
+        parsed = _parse_results(criteria, result["raw"])
+        parsed["auto_installed"] = auto_installed
+        return parsed
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
 

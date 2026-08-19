@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import sys
 from dotenv import load_dotenv
 
 from config.settings import PipelineConfig
@@ -20,7 +21,18 @@ from agents.testing import TestingAgent
 from agents.acceptance import AcceptanceAgent
 from agents.deployment import DeploymentAgent
 from agents.builder import BuilderAgent
+from agents.spec_agent import SpecAgent
 from pipeline import PipelineOrchestrator
+from pipeline.spec_pipeline import run_spec_pipeline
+from tools.spec_render import render_spec
+
+# 强制控制台输出 UTF-8：源码与所有产物均为 UTF-8，Windows 默认 GBK 控制台会把中文打印成乱码。
+# errors="replace" 保证即使终端编码异常也不会抛 UnicodeEncodeError 中断流程。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 async def run_requirements(user_input: str) -> None:
@@ -369,11 +381,161 @@ def save_builder_output(result) -> str | None:
     return project_dir
 
 
+def _review_spec_interactive():
+    """构造交互式人工审阅回调：渲染 spec 清单 → 让用户通过/放弃/给修改意见。"""
+    async def review(spec):
+        print("\n" + render_spec(spec))
+        print("\n请审阅上面的 Spec（这是全系统唯一需要你拍板的点）：")
+        print("  [y / 回车] 通过，继续生成")
+        print("  [n]        放弃，停止运行")
+        print("  其它输入 = 修改意见，回车后据此重新生成 Spec")
+        try:
+            ans = input("> ").strip()
+        except EOFError:
+            return "approve"  # 非交互环境（如管道输入），自动通过
+        low = ans.lower()
+        if low in ("y", "yes", ""):
+            return "approve"
+        if low in ("n", "no", "q", "quit"):
+            return "reject"
+        return ans
+
+    return review
+
+
+async def run_spec(user_input: str) -> None:
+    """运行 spec-driven 流水线（新架构：Spec → 人工审阅 → 确定性推导 → 代码 → 确定性验证 → 部署）"""
+    config = PipelineConfig.from_env()
+    llm = OpenAIAdapter(api_key=config.api_key, base_url=config.base_url, model=config.model)
+
+    spec_agent = SpecAgent(llm)
+    builder = BuilderAgent(llm)
+    deployment_agent = DeploymentAgent(llm)
+
+    print("\n" + "=" * 60)
+    print("运行 spec-driven 流水线（NL → Spec → 人工审阅 → 确定性推导 → 代码 → 确定性验证 → 部署）...")
+    print("=" * 60)
+
+    result = await run_spec_pipeline(
+        user_input, spec_agent, builder, deployment_agent,
+        spec_review=_review_spec_interactive(),
+    )
+
+    print(f"\n状态: {result['status']}")
+    print(f"项目: {result['project_name']}")
+    print(f"耗时: {result['duration_seconds']:.1f}s")
+
+    spec = result.get("spec") or {}
+    if spec:
+        print(f"Spec 端点: {len(spec.get('endpoints', []))} 个, 规则: {len(spec.get('rules', []))} 条")
+
+    tr = result.get("test_result") or {}
+    if tr:
+        print(f"测试: {tr.get('passed', 0)} passed / {tr.get('failed', 0)} failed, all_passed={tr.get('all_passed')}")
+    contract = result.get("contract") or {}
+    if contract:
+        print(f"契约: match={contract.get('match')} (缺 {contract.get('missing')}, 多 {contract.get('extra')})")
+    print(f"覆盖率: {result.get('coverage_line')}%")
+    print(f"门槛通过: {result['gate_ok']}")
+    if result.get("gate_reasons"):
+        for r in result["gate_reasons"]:
+            print(f"  - {r}")
+
+    if result.get("error"):
+        print(f"\n错误: {result['error']}")
+
+    print("=" * 60)
+    save_spec_output(result)
+
+
+def save_spec_output(result) -> str | None:
+    """把 spec-driven 流水线产物（spec + 代码 + 测试 + 验证摘要）落盘。"""
+    code_files = result.get("code_files") or []
+    if not code_files:
+        print("\n[spec] 无代码产物，跳过保存")
+        return None
+
+    raw_name = str(result.get("project_name") or "spec_project")
+    project_name = re.sub(r"[^0-9a-zA-Z_]+", "_", raw_name).strip("_").lower() or "spec_project"
+    project_dir = os.path.join(OUTPUT_BASE, project_name)
+    shutil.rmtree(project_dir, ignore_errors=True)
+    written = 0
+
+    def write_file(rel_path: str, content: str) -> None:
+        nonlocal written
+        if not content:
+            return
+        dest = _safe_join(project_dir, rel_path)
+        if dest is None:
+            print(f"  [跳过] 非法路径: {rel_path!r}")
+            return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write(content)
+        written += 1
+
+    for cf in code_files:
+        write_file(cf.get("path", ""), cf.get("content", ""))
+    for tf in result.get("test_files", []):
+        write_file(tf.get("path", ""), tf.get("content", ""))
+
+    # spec 是唯一真相源，落盘成 JSON 便于人审阅/改后重跑
+    write_file("spec.json", json.dumps(result.get("spec") or {}, ensure_ascii=False, indent=2))
+
+    # 兜底 requirements.txt
+    has_req = any((cf.get("path") or "").strip().lstrip("/\\") == "requirements.txt" for cf in code_files)
+    if not has_req:
+        write_file("requirements.txt", "fastapi>=0.104\nuvicorn>=0.24\npytest>=7\nhttpx>=0.24\n")
+
+    # 部署产物
+    deploy = result.get("deployment") or {}
+    if isinstance(deploy, dict):
+        docker = deploy.get("docker_config") or {}
+        write_file("Dockerfile", docker.get("dockerfile", ""))
+        write_file("docker-compose.yml", docker.get("docker_compose", ""))
+
+    tr = result.get("test_result") or {}
+    summary = {
+        "project_name": project_name,
+        "status": result.get("status"),
+        "duration_s": round(result.get("duration_seconds", 0), 1),
+        "gate_ok": result.get("gate_ok"),
+        "gate_reasons": result.get("gate_reasons", []),
+        "coverage_line": result.get("coverage_line"),
+        "contract": result.get("contract"),
+        "spec": result.get("spec"),
+        "testing": {
+            "total_tests": tr.get("total_tests"),
+            "passed": tr.get("passed"),
+            "failed": tr.get("failed"),
+            "all_passed": tr.get("all_passed"),
+            "coverage_line": (tr.get("coverage") or {}).get("line"),
+            "auto_installed": tr.get("auto_installed", []),
+            "smoke": tr.get("smoke_test", {}),
+            "raw_output": tr.get("raw_output", "")[:6000],
+        },
+    }
+    write_file("summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
+
+    # 复制运行日志进项目目录
+    run_log = os.path.join(OUTPUT_BASE, "run.log")
+    if os.path.exists(run_log):
+        try:
+            shutil.copy2(run_log, os.path.join(project_dir, "run.log"))
+        except OSError:
+            pass
+
+    rel = os.path.relpath(project_dir, os.path.dirname(os.path.abspath(__file__)))
+    print(f"\n已生成 {written} 个文件 → {rel}/")
+    return project_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="多智能体应用开发系统 V2")
     parser.add_argument("--input", "-i", type=str, help="用户需求输入")
     parser.add_argument("--pipeline", action="store_true", help="运行完整流水线")
     parser.add_argument("--builder", action="store_true", help="运行 Builder 自主循环（requirements→technical→builder）")
+    parser.add_argument("--spec", action="store_true", help="运行 spec-driven 流水线（新架构）")
 
     args = parser.parse_args()
 
@@ -387,6 +549,8 @@ def main():
 
     if args.builder:
         asyncio.run(run_builder(user_input))
+    elif args.spec:
+        asyncio.run(run_spec(user_input))
     elif args.pipeline:
         asyncio.run(run_pipeline(user_input))
     else:
