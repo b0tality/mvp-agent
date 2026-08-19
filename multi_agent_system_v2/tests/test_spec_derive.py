@@ -110,9 +110,62 @@ def test_derived_acceptance_runs_green():
     assert data["all_passed"] is True, data
 
 
+# ---------------------------------------------------------------------------
+# query 参数修复：查询参数走 query_params 字段，不拼进 path
+# ---------------------------------------------------------------------------
+
+TASKS_MAIN = {
+    "path": "main.py",
+    "content": '''from fastapi import FastAPI
+from typing import Optional
+
+app = FastAPI()
+
+@app.get("/tasks")
+def list_tasks(priority: Optional[str] = None):
+    return []
+''',
+}
+
+
+def test_derive_acceptance_emits_query_params():
+    """query_params 字段应生成 client.get(path, params=...) 而非拼进 path。"""
+    spec = ProjectSpec(project_name="tasks", endpoints=[
+        EndpointSpec(method="GET", path="/tasks",
+                     query_params={"priority": "high"}, response_status=200),
+    ])
+    code = derive_acceptance_tests(spec)
+    assert "client.get('/tasks'" in code, code
+    assert "params={'priority': 'high'}" in code, code
+    assert "?priority" not in code, "查询参数不该拼进 path"
+
+
+def test_derive_acceptance_does_not_skip_query_path():
+    """path 里偶发混入 ?query={x} 时，不该被误判为路径参数而跳过测试。"""
+    spec = ProjectSpec(project_name="tasks", endpoints=[
+        EndpointSpec(method="GET", path="/tasks?priority={priority}", response_status=200),
+    ])
+    code = derive_acceptance_tests(spec)
+    assert "test_endpoint_0_" in code, "带查询串的端点不应被跳过"
+    assert "client.get('/tasks'" in code, code
+
+
+def test_contract_check_strips_query_from_path():
+    """契约校验应把 path 里的查询串剥掉再比（/tasks?priority=x 与 /tasks 视为同一端点）。"""
+    spec = ProjectSpec(project_name="tasks", endpoints=[
+        EndpointSpec(method="GET", path="/tasks?priority={priority}", response_status=200),
+    ])
+    r = contract_check(spec, [TASKS_MAIN])
+    assert r["match"] is True, r
+    assert r["missing"] == [] and r["extra"] == [], r
+
+
 if __name__ == "__main__":
     test_derive_acceptance_deterministic()
     test_contract_check_matches()
     test_contract_check_detects_missing_endpoint()
     test_derived_acceptance_runs_green()
-    print("[PASS] spec_derive: 确定性验收推导 + 契约校验(抓到漏端点) + 推导测试真跑全绿")
+    test_derive_acceptance_emits_query_params()
+    test_derive_acceptance_does_not_skip_query_path()
+    test_contract_check_strips_query_from_path()
+    print("[PASS] spec_derive: 确定性验收推导 + 契约校验(抓到漏端点) + query 参数修复")

@@ -37,6 +37,15 @@ def _has_path_param(path: str) -> bool:
     return "{" in (path or "")
 
 
+def _strip_query(path: str) -> str:
+    """把 path 里的查询串（?k=v...）剥掉——查询参数应走 query_params 字段，不该在 path 里。
+
+    SpecAgent 偶发仍会把筛选条件拼进 path（如 /tasks?priority=x），这里防御性剥掉，
+    保证下游推导/契约匹配只认「资源路径」。
+    """
+    return (path or "").split("?", 1)[0]
+
+
 def derive_acceptance_tests(spec) -> str:
     """从 Spec 确定性生成验收 pytest（零 LLM）。
 
@@ -56,26 +65,32 @@ def derive_acceptance_tests(spec) -> str:
     # 1. 端点成功测试（无路径参数）
     for i, ep in enumerate(spec.endpoints):
         method = (ep.method or "get").lower()
-        path = ep.path or "/"
+        path = _strip_query(ep.path or "/")
         if _has_path_param(path):
             continue
         status = ep.response_status or 200
         fn = f"test_endpoint_{i}_{_path_slug(path, method)}"
+        call = f"client.{method}({path!r}"
         if ep.request_body is not None:
-            call = f"client.{method}({path!r}, json={ep.request_body!r})"
-        else:
-            call = f"client.{method}({path!r})"
+            call += f", json={ep.request_body!r}"
+        qp = getattr(ep, "query_params", None) or None
+        if qp:
+            call += f", params={qp!r}"
+        call += ")"
         lines.append(f"def {fn}():\n    r = {call}\n    assert r.status_code == {status}, r.text\n")
 
     # 2. 规则测试
     for i, rule in enumerate(spec.rules):
         method = (rule.method or "get").lower()
-        path = rule.path or "/"
+        path = _strip_query(rule.path or "/")
         fn = f"test_rule_{i}"
+        call = f"client.{method}({path!r}"
         if rule.request_body is not None:
-            call = f"client.{method}({path!r}, json={rule.request_body!r})"
-        else:
-            call = f"client.{method}({path!r})"
+            call += f", json={rule.request_body!r}"
+        qp = getattr(rule, "query_params", None) or None
+        if qp:
+            call += f", params={qp!r}"
+        call += ")"
         assert_line = f"assert r.status_code == {rule.expect_status}, r.text"
         if rule.expect_contains:
             assert_line += f"\n    assert {rule.expect_contains!r} in r.text"
@@ -85,8 +100,9 @@ def derive_acceptance_tests(spec) -> str:
 
 
 def _normalize_path(path: str) -> str:
-    """把路径参数名归一化为 {p}，使 /todos/{id} 与 /todos/{todo_id} 视为同一端点。"""
-    return re.sub(r"/\{[^}]*\}", "/{p}", path or "")
+    """把路径参数名归一化为 {p}，并剥掉查询串，使 /todos/{id} 与 /todos/{todo_id}、
+    /tasks?priority=x 与 /tasks 视为同一端点。"""
+    return re.sub(r"/\{[^}]*\}", "/{p}", _strip_query(path or ""))
 
 
 def _openapi_paths(code_files: List[Dict], timeout: int = 60):

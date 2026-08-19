@@ -26,7 +26,10 @@ _SPEC_SYSTEM = """你是一位严格的 API 规格编写器。把用户的自然
    - 路径用 REST 风格，路径参数用 {id} 形式（如 /todos/{id}）。
    - request_body 是「能成功触发该端点的合法 JSON 示例」（GET/DELETE 留空）。
    - response_status 是成功状态码（POST 常为 201，DELETE 常为 204，其余 200）。
-3. rules：列出**关键行为/校验规则**，每条必须能用一个 HTTP 请求客观判定，给 method / path / request_body / expect_status（必要时给 expect_contains 子串）。
+   - 查询参数（筛选/搜索/分页，如「按优先级筛选」「按书名搜索」「limit/offset」）写进 query_params 字段
+     （如 {"priority": "high"} 或 {"q": "python", "limit": "10"}），**绝对不要拼进 path**。
+     path 只写资源路径本身（如 /tasks 或 /books），不含 ?query=...。
+3. rules：列出**关键行为/校验规则**，每条必须能用一个 HTTP 请求客观判定，给 method / path / request_body / expect_status（必要时给 expect_contains 子串，必要时给 query_params）。
    - expect_contains 只能是字符串，不需要时**省略该字段**（不要写空数组 []、空对象 {} 或空字符串 ""）。
    - 必覆盖：必填字段缺失/非法 → 状态码；非法输入 → 422/400；唯一键冲突 → 409/400；资源不存在 → 404。
    - path **不要用 {id} 参数**（规则针对可无状态触发的校验，如 POST 校验、GET 列表）；资源级 404/删除 404 由系统的不变式测试覆盖。

@@ -42,9 +42,13 @@ def render_spec(spec) -> str:
     lines.append(f"【API 端点】({len(endpoints)})")
     for i, ep in enumerate(endpoints, 1):
         method = str(_g(ep, "method", "")).upper()
-        path = _g(ep, "path", "")
+        path = str(_g(ep, "path", "")).split("?", 1)[0]
         status = _g(ep, "response_status", 200)
-        lines.append(f"  {i}. {method} {path}  →  {status}")
+        qp = _g(ep, "query_params", None)
+        qs = ""
+        if qp:
+            qs = "?" + "&".join(f"{k}={v}" for k, v in qp.items())
+        lines.append(f"  {i}. {method} {path}{qs}  →  {status}")
         summary = str(_g(ep, "summary", "")).strip()
         if summary:
             lines.append(f"     {summary}")
@@ -58,10 +62,14 @@ def render_spec(spec) -> str:
         lines.append("  （无）")
     for i, rule in enumerate(rules, 1):
         method = str(_g(rule, "method", "")).upper()
-        path = _g(rule, "path", "")
+        path = str(_g(rule, "path", "")).split("?", 1)[0]
         status = _g(rule, "expect_status", 0)
         desc = str(_g(rule, "description", "")).strip()
-        lines.append(f"  {i}. {method} {path}  期望 {status}")
+        qp = _g(rule, "query_params", None)
+        qs = ""
+        if qp:
+            qs = "?" + "&".join(f"{k}={v}" for k, v in qp.items())
+        lines.append(f"  {i}. {method} {path}{qs}  期望 {status}")
         if desc:
             lines.append(f"     {desc}")
         body = _body(rule)
