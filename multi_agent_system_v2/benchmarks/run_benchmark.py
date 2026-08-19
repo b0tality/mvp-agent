@@ -37,7 +37,10 @@ from agents.deployment import DeploymentAgent
 from pipeline.spec_pipeline import run_spec_pipeline
 from benchmarks.cases import get_cases
 
-RESULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.json")
+def _result_file(suite: str) -> str:
+    """v1 结果沿用 results.json（已提交的基线），其它 suite 落到 results_<suite>.json 以免覆盖。"""
+    name = "results.json" if suite == "v1" else f"results_{suite}.json"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 
 async def run_one(name: str, requirement: str, llm) -> dict:
@@ -75,12 +78,12 @@ def _fmt_row(res: dict) -> str:
     )
 
 
-async def main(names) -> None:
+async def main(names, suite="v2") -> None:
     cfg = PipelineConfig.from_env()
     llm = OpenAIAdapter(api_key=cfg.api_key, base_url=cfg.base_url, model=cfg.model)
 
-    cases = get_cases(names)
-    print(f"跑 {len(cases)} 个用例（model={cfg.model}）...\n")
+    cases = get_cases(names, suite=suite)
+    print(f"跑 {len(cases)} 个用例（model={cfg.model} suite={suite}）...\n")
     results = []
     for case in cases:
         t0 = time.time()
@@ -106,13 +109,16 @@ async def main(names) -> None:
         print(f"平均重试轮数: {sum(retries)/len(retries):.1f}" if retries else "平均重试轮数: n/a")
     print("=" * 70)
 
-    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+    result_file = _result_file(suite)
+    with open(result_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    print(f"\n结果已落盘 → {os.path.relpath(RESULT_FILE, os.getcwd())}")
+    print(f"\n结果已落盘 → {os.path.relpath(result_file, os.getcwd())}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="spec-driven 基准运行器")
     parser.add_argument("cases", nargs="*", help="只跑指定用例名（默认全部）")
+    parser.add_argument("--suite", choices=["v1", "v2"], default="v2",
+                        help="用例集：v1 首轮基线 / v2 新一轮多样形态（默认 v2）")
     args = parser.parse_args()
-    asyncio.run(main(args.cases))
+    asyncio.run(main(args.cases, args.suite))
