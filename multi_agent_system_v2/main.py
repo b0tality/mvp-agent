@@ -22,6 +22,7 @@ from agents.acceptance import AcceptanceAgent
 from agents.deployment import DeploymentAgent
 from agents.builder import BuilderAgent
 from agents.spec_agent import SpecAgent
+from agents.spec_review_agent import SpecReviewAgent
 from pipeline import PipelineOrchestrator
 from pipeline.spec_pipeline import run_spec_pipeline
 from tools.spec_render import render_spec
@@ -403,8 +404,8 @@ def _review_spec_interactive():
     return review
 
 
-async def run_spec(user_input: str) -> None:
-    """运行 spec-driven 流水线（新架构：Spec → 人工审阅 → 确定性推导 → 代码 → 确定性验证 → 部署）"""
+async def run_spec(user_input: str, auto_review: bool = True) -> None:
+    """运行 spec-driven 流水线（新架构：Spec → 人工审阅 → 自动评审 → 确定性推导 → 代码 → 确定性验证 → 部署）"""
     config = PipelineConfig.from_env()
     llm = OpenAIAdapter(api_key=config.api_key, base_url=config.base_url, model=config.model)
 
@@ -413,12 +414,13 @@ async def run_spec(user_input: str) -> None:
     deployment_agent = DeploymentAgent(llm)
 
     print("\n" + "=" * 60)
-    print("运行 spec-driven 流水线（NL → Spec → 人工审阅 → 确定性推导 → 代码 → 确定性验证 → 部署）...")
+    print("运行 spec-driven 流水线（NL → Spec → 人工审阅 → 自动评审 → 确定性推导 → 代码 → 确定性验证 → 部署）...")
     print("=" * 60)
 
     result = await run_spec_pipeline(
         user_input, spec_agent, builder, deployment_agent,
         spec_review=_review_spec_interactive(),
+        spec_auto_review=SpecReviewAgent(llm).to_callback() if auto_review else None,
     )
 
     print(f"\n状态: {result['status']}")
@@ -536,6 +538,7 @@ def main():
     parser.add_argument("--pipeline", action="store_true", help="运行完整流水线")
     parser.add_argument("--builder", action="store_true", help="运行 Builder 自主循环（requirements→technical→builder）")
     parser.add_argument("--spec", action="store_true", help="运行 spec-driven 流水线（新架构）")
+    parser.add_argument("--no-auto-review", action="store_true", help="关闭 Spec 自动完备性评审")
 
     args = parser.parse_args()
 
@@ -550,7 +553,7 @@ def main():
     if args.builder:
         asyncio.run(run_builder(user_input))
     elif args.spec:
-        asyncio.run(run_spec(user_input))
+        asyncio.run(run_spec(user_input, auto_review=not args.no_auto_review))
     elif args.pipeline:
         asyncio.run(run_pipeline(user_input))
     else:

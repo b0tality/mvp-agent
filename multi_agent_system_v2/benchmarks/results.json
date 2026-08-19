@@ -1,0 +1,115 @@
+[
+  {
+    "name": "auth_register_login",
+    "gate_ok": true,
+    "status": "success",
+    "coverage": 100,
+    "contract_match": true,
+    "contract_missing": [],
+    "contract_extra": [],
+    "tests_passed": 10,
+    "tests_failed": 0,
+    "build_rounds": 1,
+    "duration_s": 326.3,
+    "error": null,
+    "gate_reasons": null
+  },
+  {
+    "name": "blog_posts_comments",
+    "gate_ok": true,
+    "status": "success",
+    "coverage": 88,
+    "contract_match": true,
+    "contract_missing": [],
+    "contract_extra": [],
+    "tests_passed": 9,
+    "tests_failed": 0,
+    "build_rounds": 1,
+    "duration_s": 54.9,
+    "error": null,
+    "gate_reasons": null
+  },
+  {
+    "name": "paginated_list",
+    "gate_ok": true,
+    "status": "success",
+    "coverage": 90,
+    "contract_match": true,
+    "contract_missing": [],
+    "contract_extra": [],
+    "tests_passed": 5,
+    "tests_failed": 0,
+    "build_rounds": 1,
+    "duration_s": 53.6,
+    "error": null,
+    "gate_reasons": null
+  },
+  {
+    "name": "order_line_items",
+    "gate_ok": true,
+    "status": "success",
+    "coverage": 88,
+    "contract_match": true,
+    "contract_missing": [],
+    "contract_extra": [],
+    "tests_passed": 7,
+    "tests_failed": 0,
+    "build_rounds": 1,
+    "duration_s": 79.1,
+    "error": null,
+    "gate_reasons": null
+  },
+  {
+    "name": "book_library_search",
+    "gate_ok": false,
+    "status": "failed",
+    "coverage": 95,
+    "contract_match": true,
+    "contract_missing": [],
+    "contract_extra": [],
+    "tests_passed": 0,
+    "tests_failed": 0,
+    "build_rounds": 2,
+    "duration_s": 270.5,
+    "error": null,
+    "gate_reasons": [
+      "测试未全部通过"
+    ]
+  },
+  {
+    "name": "counter_atomic",
+    "gate_ok": false,
+    "status": "failed",
+    "coverage": 90,
+    "contract_match": true,
+    "contract_missing": [],
+    "contract_extra": [],
+    "tests_passed": 7,
+    "tests_failed": 1,
+    "build_rounds": 2,
+    "duration_s": 187.6,
+    "error": null,
+    "gate_reasons": [
+      "测试未全部通过"
+    ]
+  },
+  {
+    "name": "task_priority_filter",
+    "gate_ok": false,
+    "status": "failed",
+    "coverage": 87,
+    "contract_match": false,
+    "contract_missing": [
+      "GET /tasks?priority={priority}"
+    ],
+    "contract_extra": [],
+    "tests_passed": 6,
+    "tests_failed": 0,
+    "build_rounds": 2,
+    "duration_s": 50.7,
+    "error": null,
+    "gate_reasons": [
+      "契约不符（缺 ['GET /tasks?priority={priority}']，多 []）"
+    ]
+  }
+]

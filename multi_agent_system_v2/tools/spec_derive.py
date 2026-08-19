@@ -89,8 +89,13 @@ def _normalize_path(path: str) -> str:
     return re.sub(r"/\{[^}]*\}", "/{p}", path or "")
 
 
-def _openapi_paths(code_files: List[Dict], timeout: int = 60) -> Optional[Dict]:
-    """把代码写进沙箱，真实 import 出 FastAPI app，返回其 openapi paths（拿不到返回 None）。"""
+def _openapi_paths(code_files: List[Dict], timeout: int = 60):
+    """把代码写进沙箱，真实 import 出 FastAPI app，返回 (paths, error)。
+
+    - 成功：返回 (paths_dict, None)；
+    - 拿不到 app / openapi 生成失败：返回 (None, error_str)，error 指明真实原因，
+      而不是把「探针失败」误报成「端点全缺」。
+    """
     sandbox = tempfile.mkdtemp(prefix="magent_spec_")
     try:
         for cf in code_files:
@@ -106,13 +111,15 @@ def _openapi_paths(code_files: List[Dict], timeout: int = 60) -> Optional[Dict]:
 
         deps = ensure_deps(code_files)
         probe = (
-            "import json, importlib, sys\n"
+            "import json, importlib, sys, traceback\n"
             "sys.path.insert(0, '.')\n"
             "app = None\n"
+            "import_err = []\n"
             "for mn in ('main', 'app', 'api', 'server'):\n"
             "    try:\n"
             "        m = importlib.import_module(mn)\n"
-            "    except Exception:\n"
+            "    except Exception as e:\n"
+            "        import_err.append('%s: %s' % (mn, e))\n"
             "        continue\n"
             "    a = getattr(m, 'app', None)\n"
             "    if a is not None and hasattr(a, 'openapi'):\n"
@@ -125,9 +132,12 @@ def _openapi_paths(code_files: List[Dict], timeout: int = 60) -> Optional[Dict]:
             "    if app is not None:\n"
             "        break\n"
             "if app is None:\n"
-            "    print('{}')\n"
+            "    print(json.dumps({'ok': False, 'error': '未找到 FastAPI app' + (('; ' + '; '.join(import_err)) if import_err else '')}))\n"
             "else:\n"
-            "    print(json.dumps(app.openapi().get('paths', {})))\n"
+            "    try:\n"
+            "        print(json.dumps({'ok': True, 'paths': app.openapi().get('paths', {})}))\n"
+            "    except Exception as e:\n"
+            "        print(json.dumps({'ok': False, 'error': 'openapi 生成失败: %s\\n%s' % (e, traceback.format_exc())}))\n"
         )
         probe_path = os.path.join(sandbox, "_probe.py")
         with open(probe_path, "w", encoding="utf-8") as f:
@@ -140,11 +150,14 @@ def _openapi_paths(code_files: List[Dict], timeout: int = 60) -> Optional[Dict]:
             capture_output=True, text=True, timeout=timeout, env=env,
         )
         try:
-            return json.loads((proc.stdout or "").strip())
+            data = json.loads((proc.stdout or "").strip())
         except json.JSONDecodeError:
-            return None
-    except Exception:
-        return None
+            return None, (proc.stderr or proc.stdout or "openapi 探针无输出").strip()[:2000]
+        if data.get("ok"):
+            return data.get("paths", {}), None
+        return None, data.get("error", "openapi 生成失败")
+    except Exception as e:
+        return None, f"openapi 探针执行异常: {e}"
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
 
@@ -157,13 +170,15 @@ def contract_check(spec, code_files: List[Dict], timeout: int = 60) -> Dict[str,
     """
     expected = {(ep.method.lower(), _normalize_path(ep.path)) for ep in spec.endpoints}
 
-    paths = _openapi_paths(code_files, timeout)
+    paths, oa_error = _openapi_paths(code_files, timeout)
     if paths is None:
+        # 探针失败（app 无法导入 / openapi 生成抛异常）≠「端点全缺」。
+        # 这里不把 missing 填成所有 expected，否则会给 builder 错误的「补端点」反馈。
         return {
             "match": False,
-            "missing": sorted(f"{m.upper()} {p}" for m, p in expected),
+            "missing": [],
             "extra": [],
-            "error": "无法获取 app.openapi()（代码可能无法导入）",
+            "error": oa_error or "无法获取 app.openapi()（代码可能无法导入）",
             "expected": len(expected),
             "actual": 0,
         }

@@ -68,7 +68,7 @@ class BuilderAgent(BaseAgent):
             self.last_verify = {}
             self.last_tests = {}
 
-            iterating = bool(feedback and current_code) and not self._spec_mode
+            iterating = bool(feedback and current_code)
             final_text = await self.llm.generate_with_tools(
                 self._system_prompt(iterating=iterating, spec_mode=self._spec_mode),
                 self._user_prompt(user_input, requirements, technical_solution, feedback, iteration, spec=spec),
@@ -183,7 +183,7 @@ class BuilderAgent(BaseAgent):
     @staticmethod
     def _system_prompt(iterating: bool = False, spec_mode: bool = False) -> str:
         if spec_mode:
-            return """你是一位资深后端工程师。你的任务是**只写代码**，实现一份给定的 API 契约（spec），
+            base = """你是一位资深后端工程师。你的任务是**只写代码**，实现一份给定的 API 契约（spec），
 使系统为你生成的测试全部通过。
 
 工作区工具：
@@ -203,6 +203,16 @@ class BuilderAgent(BaseAgent):
 - 功能真实实现，不能是 TODO 占位。
 - 代码语法正确、可编译、可运行。
 - 不要写测试文件——测试已由系统从 spec 确定性生成，你写的会被忽略。"""
+            if iterating:
+                base += """
+
+【本轮是修复迭代】工作区里已放有上一版代码 + 系统生成的测试，上一版没通过验证，反馈里给了具体失败原因。
+请按下面顺序只做定点修复：
+1. 先调 run_tests 看当前失败状态（或直接 write_code 定点修复）。
+2. 根据反馈里的测试失败 traceback 和契约差异，write_code 定点修改代码。
+3. 只改有问题的部分；不要增删 spec 之外的端点，不要重写已通过的代码，不要改动系统生成的测试。
+4. 修完调 verify_code + run_tests 验证，直到 all_passed=true 再停。"""
+            return base
 
         base = """你是一位资深全栈开发工程师。目标是产出一个「编译通过 + 测试全过」的可运行 FastAPI MVP。
 
@@ -245,12 +255,15 @@ class BuilderAgent(BaseAgent):
         spec: Dict = None,
     ) -> str:
         if spec:
-            # spec 模式：只喂契约，LLM 的唯一目标是实现它
+            # spec 模式：只喂契约，LLM 的唯一目标是实现它；修复迭代时附加失败反馈
             import json as _json
-            return (
+            msg = (
                 "API 契约（spec，必须精确实现每一个端点与规则）：\n"
                 + _json.dumps(spec, ensure_ascii=False, indent=2)
             )
+            if feedback:
+                msg += "\n\n" + BuilderAgent._format_feedback(feedback)
+            return msg
         parts = []
         if iteration:
             parts.append(f"【第 {iteration} 次修复迭代】")
