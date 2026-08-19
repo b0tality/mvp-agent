@@ -160,6 +160,33 @@ def test_contract_check_strips_query_from_path():
     assert r["missing"] == [] and r["extra"] == [], r
 
 
+def test_derive_acceptance_409_rule_seeds_first():
+    """唯一键冲突规则（409）必须先种资源再触发冲突，不能单次无状态请求。"""
+    spec = ProjectSpec(project_name="counters", endpoints=[
+        EndpointSpec(method="POST", path="/counters",
+                     request_body={"name": "x"}, response_status=201),
+    ], rules=[
+        RuleSpec(description="名字唯一", method="POST", path="/counters",
+                 request_body={"name": "x"}, expect_status=409),
+    ])
+    code = derive_acceptance_tests(spec)
+    assert "先种资源" in code, code
+    assert "assert r.status_code == 409" in code, code
+    fn = code[code.index("def test_rule_0"):]
+    assert fn.count("client.post('/counters'") == 2, fn  # 种子 + 触发
+
+
+def test_derive_acceptance_non_conflict_rule_no_seed():
+    """非 409 规则（如 422 校验）不该加种子请求。"""
+    spec = ProjectSpec(project_name="todos", endpoints=[], rules=[
+        RuleSpec(description="空标题 422", method="POST", path="/todos",
+                 request_body={"title": ""}, expect_status=422),
+    ])
+    code = derive_acceptance_tests(spec)
+    assert "先种资源" not in code
+    assert code.count("client.post('/todos'") == 1, code
+
+
 if __name__ == "__main__":
     test_derive_acceptance_deterministic()
     test_contract_check_matches()
@@ -168,4 +195,6 @@ if __name__ == "__main__":
     test_derive_acceptance_emits_query_params()
     test_derive_acceptance_does_not_skip_query_path()
     test_contract_check_strips_query_from_path()
-    print("[PASS] spec_derive: 确定性验收推导 + 契约校验(抓到漏端点) + query 参数修复")
+    test_derive_acceptance_409_rule_seeds_first()
+    test_derive_acceptance_non_conflict_rule_no_seed()
+    print("[PASS] spec_derive: 确定性验收推导 + 契约校验 + query 参数修复 + 409 种子")

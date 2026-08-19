@@ -94,7 +94,19 @@ def derive_acceptance_tests(spec) -> str:
         assert_line = f"assert r.status_code == {rule.expect_status}, r.text"
         if rule.expect_contains:
             assert_line += f"\n    assert {rule.expect_contains!r} in r.text"
-        lines.append(f"def {fn}():\n    r = {call}\n    {assert_line}\n")
+
+        # 409 冲突（重复创建/唯一键）不能用单次无状态请求判定：第一次创建必然成功。
+        # 必须先种一个资源、再发一次触发冲突。种子请求结果忽略（可能已被别的测试建过），
+        # 不依赖执行顺序，也不改请求值，对 email/uuid 等格式字段同样安全。
+        if rule.expect_status == 409 and rule.request_body is not None and method in ("post", "put"):
+            lines.append(
+                f"def {fn}():\n"
+                f"    client.{method}({path!r}, json={rule.request_body!r})  # 先种资源（结果忽略，可能已存在）\n"
+                f"    r = {call}\n"
+                f"    {assert_line}\n"
+            )
+        else:
+            lines.append(f"def {fn}():\n    r = {call}\n    {assert_line}\n")
 
     return "\n".join(lines) + "\n"
 
