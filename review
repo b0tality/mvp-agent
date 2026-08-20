@@ -1,0 +1,174 @@
+下面给出一份可执行、分优先级的优化方案，目标是把仓库从“研究/原型”升到“可在 CI 中稳定运行、易于贡献和复用”的状态。前言：我已经查看了 README、multi_agent_system_v2/main.py、tests（test_spec_derive.py）、requirements.txt、.gitignore 等文件，文件中有较完整的设计、确定性测试和产物落盘逻辑，但存在可移植性、开源治理、依赖管理与 CI 自动化的短板。优化方案下按「目标／任务／为什么要改／影响文件／估算工时／验收标准」组织，后面附带可直接使用的 CI workflow、修补片段与 LICENSE 文本（可直接复制到仓库）。
+
+一、关键优先项（阻断类）
+1) 移除 / 修复硬编码路径（高）
+- 目标：让 main.py 与测试在 Linux/CI 环境可运行（现在用到 Windows 绝对路径）。
+- 为什么：硬编码导致在 CI 或其他开发者机器上读取不到 .env 或引入路径问题（会直接失败或让行为不可复现）。
+- 修改位置：
+  - multi_agent_system_v2/main.py — 移除或改为可发现 .env 的通用逻辑（使用 dotenv.find_dotenv 或 以环境变量优先）。
+  - multi_agent_system_v2/tests/test_spec_derive.py — 去掉 sys.path.insert 中硬编码路径。
+- 建议实现（验收）：将 load_dotenv(...) 替换为可移植实现；测试中不再依赖绝对路径，pytest 在 CI 下能跑通。
+- 估算：0.25–1 小时
+- 验收标准：在 ubuntu-latest runner 上运行 pytest tests 能通过（或至少启动，不被路径问题阻断）。
+
+示例替换（把这段替换 main.py 中的那行）：
+```python name=multi_agent_system_v2/main.py
+# 原来（示例）
+# load_dotenv(r"C:\Users\MECHREV\agent\multi_agent_system\.env", override=True)
+
+# 建议替换为：
+from dotenv import find_dotenv, load_dotenv
+env_path = os.environ.get("MULTI_AGENT_DOTENV") or find_dotenv(".env", usecwd=True)
+if env_path:
+    load_dotenv(env_path, override=True)
+else:
+    # 不要强制失败；CI 可以通过 env variables 注入密钥
+    load_dotenv(override=True)
+```
+
+测试文件中删除 sys.path 插入（示例）：
+```python name=multi_agent_system_v2/tests/test_spec_derive.py
+# 删除或注释掉这类硬编码行：
+# sys.path.insert(0, r'C:\Users\MECHREV\agent\multi_agent_system_v2')
+
+# 推荐做法：
+# - 在 CI 中用 `pip install -e .` 或 `PYTHONPATH=.` 启动 pytest
+# - 或者在 tests/conftest.py 设置相对 import helper
+```
+
+2) 添加 LICENSE（高）
+- 目标：明确许可（README 写 MIT，但仓库未包含 LICENSE 文件）。
+- 影响文件：添加根目录 LICENSE。
+- 估算：5–10 分钟
+- 验收：LICENSE 文件存在且内容为 MIT。
+
+MIT LICENSE 文件示例（可直接添加到仓库根）：
+```text name=LICENSE
+MIT License
+
+Copyright (c) 2026 b0tality
+
+Permission is hereby granted, free of charge, to any person obtaining a copy...
+(完整 MIT 文本，省略于此，添加标准 MIT 模板)
+```
+
+二、自动化与持续集成（中高）
+3) 添加 GitHub Actions CI（中高）
+- 目标：推送/PR 自动运行 pytest、代码格式和静态检查（black/ruff/mypy）。
+- 为什么：确保代码质量不回退、跨平台可运行、及时发现依赖/测试问题。
+- 推荐 workflow:
+  - runs-on: ubuntu-latest
+  - strategy: python-version: 3.11
+  - steps: checkout, cache pip, setup-python, install minimal deps (先分离依赖，再安装 runtime+test deps), run pytest, run ruff/black/mypy
+- 估算：1–2 小时（包含调试）
+- 验收：PR 中 CI 通过，pytest 在 matrix runner 上能跑且不会因为路径或 Windows 特殊处理失败。
+
+示例 CI 文件（保存为 .github/workflows/ci.yml）：
+```yaml name=.github/workflows/ci.yml
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.11']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install dependencies (dev)
+        run: |
+          python -m pip install --upgrade pip
+          # prefer dev/runtime split - adjust path if you split requirements
+          pip install -r multi_agent_system/requirements.txt
+          pip install -r multi_agent_system_v2/requirements.txt || true
+      - name: Run tests
+        run: |
+          cd multi_agent_system_v2
+          pytest -q
+      - name: Run linters (ruff)
+        run: |
+          pip install ruff
+          ruff check .
+```
+（注：上面“install”行假设你会拆分 requirements；如果 requirements 很大，CI 可只安装运行本次测试需要的最小集以加速）
+
+4) 在 CI 中注入敏感信息与安全
+- 目标：LLM keys 不放在 repo；在 Actions secrets 中配置 LOCAL_LLM_API_KEY 等
+- 验收：workflow 能从 secrets 中读取并在需要的 job 中使用（but tests that call real LLM should be disabled in public CI; mock adapter instead）
+- 估算：15–30 分钟
+
+三、依赖与打包（中）
+5) 拆分 / 精简依赖（中）
+- 目标：区分 runtime 与 dev/test deps；移除重复；
+- 为什么：减小 CI 安装成本、明确每个模块的真实依赖（V2 项目本身可以只依赖 pydantic、httpx、pytest 等）。
+- 变更点：把 monolithic requirements.txt 拆为：
+  - requirements.txt (runtime minimal for multi_agent_system_v2)
+  - requirements-dev.txt (pytest, ruff, black, mypy, docs, etc.)
+- 估算：1–2 小时（检查重复并精简）
+- 验收：CI 安装时间降显著，core runtime 安装顺利。
+
+6) 添加 pyproject.toml（可选，但推荐）
+- 目标：使用标准化工具（black/mypy/ruff）以及可安装包（pip install -e .）
+- 估算：0.5–1 小时
+
+四、测试稳定性与可复现（中）
+7) 将测试改为 CI 可运行且可离线（中）
+- 目标：把调用真实 LLM 的测试与确定性无 LLM 的测试分开；为需要 LLM 的集成测试提供 mock adapter 或在 CI 中以标记 skip（需要 secrets + paid LLM）。
+- 实施：
+  - 在 pytest.ini / tox.ini 中定义 markers：@pytest.mark.integration_llm
+  - CI 默认只运行 unit/deterministic tests（tools/spec_derive 的测试属于此类）
+- 估算：0.5–1 小时
+- 验收：pytest -q 在 CI 运行并通过；integration tests 仅在指定 runners（有 secrets）上运行。
+
+8) 改进测试导入方式（中小）
+- 目标：去掉 sys.path hacks，使用 package layout 或 pip install -e .
+- 变更：添加 setup.cfg / pyproject，或改写 test 引入方法为相对 / package import。
+- 估算：30–90 分钟
+
+五、代码质量与 DX（低→中）
+9) 引入 pre-commit 钩子（black, ruff, isort）（低）
+- 目标：保持代码风格一致，减少 PR 评论轮次。
+- 估算：30 分钟
+
+10) 提升文档与贡献指南（低）
+- 目标：添加 CONTRIBUTING.md、ISSUE_TEMPLATE、PR_TEMPLATE、CODE_OF_CONDUCT，补充如何在 CI 环境下本地复现。
+- 估算：1–2 小时
+
+11) 生成器产物可复现策略（中）
+- 建议：对 output/ 目录加入 deterministic timestamp 或记录生成器版本到 summary.json（main.py 已保存 summary.json，但确认包含 LLM model+adapter info）
+- 估算：30–60 分钟
+
+六、安全与合规（中）
+12) Secrets 滤除 & .env 政策（中）
+- 目标：确保 .env 已列入 .gitignore（已在 .gitignore），并在 README 中明确 secrets 放置方法与注意事项（不要在 PR 中暴露 keys）。
+- 估算：15–30 分钟
+
+七、可观测性 / 产物管理（可选）
+13) Artefact upload（CI）与 release（可选）
+- 在 CI 成功后把 generated artifact（spec.json + summary.json）作为 workflow artifact 上传，便于审查。
+- 估算：30–60 分钟
+
+优先级与时间线（建议上手顺序）
+- 优先级 P0（0–1 day）：修复硬编码路径、添加 LICENSE、修复测试导入、初步 CI（只跑 deterministic tests）。
+- 优先级 P1（1–3 days）：拆分依赖、完善 CI（lint、mypy、black）、pre-commit、测试标记化（LLM tests skip）。
+- 优先级 P2（3–7 days）：pyproject + package install（editable）、artifact upload、contrib 文档与 templates。
+- 长期（两周+）：安全审查、自动发布、性能基准/监控（如果需要在线运行服务）。
+
+可直接交付的文件（我已经为你准备好）
+- CI workflow 模板（上面已给出 .github/workflows/ci.yml）
+- main.py 中 dotenv 可移植替换代码片段（上文）
+- 测试中 sys.path 删除建议（上文）
+- MIT LICENSE 模板（上文）
+
+下一步（我能替你做）
+- 我可以为你：
+  - 生成一个 PR，包含：1) 修复 main.py dotenv 的改动，2) 从 tests 删除硬编码 sys.path 行并加入 conftest.py 或在 README 里说明运行方法，3) 新增 LICENSE 文件，4) 新增基本 .github/workflows/ci.yml（上面示例）——一次性推送。
+  - 或先只创建 CI workflow + small fix，以便立刻在 GitHub 上看到 CI 报告（推荐启动）。
+
+你想让我先自动创建上述哪个改动（例如“创建 CI + LICENSE + main.py 修复 PR”），还是先把 CI workflow 的完整、精简版本发给你以便手动复制粘贴？
