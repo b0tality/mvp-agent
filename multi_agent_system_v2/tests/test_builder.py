@@ -142,7 +142,7 @@ async def main():
     print("[PASS] BuilderAgent: write_code → verify_code → run_tests(真实执行) 状态流转正确")
 
 
-async def test_empty_output_fallback():
+def test_empty_output_fallback():
     """第一轮 LLM 只吐文字不调 write_code（DeepSeek 偶发）→ 兜底重试一次并勒令调用工具。"""
     write_args = json.dumps({
         "code_files": [MAIN_PY, REQ_TXT],
@@ -159,7 +159,10 @@ async def test_empty_output_fallback():
     llm.client = FakeClient(script)
     builder = BuilderAgent(llm)
 
-    result = await builder.execute(user_input="待办事项 API")
+    async def run():
+        return await builder.execute(user_input="待办事项 API")
+
+    result = asyncio.run(run())
 
     assert result.status == "success", f"status={result.status} err={result.error}"
     assert len(result.data["code_files"]) == 2, result.data.get("code_files")
@@ -171,4 +174,4 @@ async def test_empty_output_fallback():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    asyncio.run(test_empty_output_fallback())
+    test_empty_output_fallback()
