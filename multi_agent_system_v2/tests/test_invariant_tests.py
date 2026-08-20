@@ -189,10 +189,76 @@ def test_invariant_skips_delete_404_when_no_get_by_id():
     assert "test_invariant_delete_then_404" not in inv, inv
 
 
+COMPOSITE_UNIQUE_MAIN = {
+    "path": "main.py", "language": "python",
+    "content": '''from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+members = []
+_next = 1
+
+class MemberCreate(BaseModel):
+    org_id: int
+    name: str
+
+class MemberOut(BaseModel):
+    id: int
+    org_id: int
+    name: str
+
+@app.post("/members", status_code=201, response_model=MemberOut)
+def create(m: MemberCreate):
+    global _next
+    for x in members:
+        if x["org_id"] == m.org_id and x["name"] == m.name:
+            raise HTTPException(409, "同组织内姓名已存在")
+    rec = {"id": _next, "org_id": m.org_id, "name": m.name}
+    members.append(rec)
+    _next += 1
+    return rec
+
+@app.get("/members", response_model=list[MemberOut])
+def list_members():
+    return members
+
+@app.get("/members/{member_id}", response_model=MemberOut)
+def get_member(member_id: int):
+    for x in members:
+        if x["id"] == member_id:
+            return x
+    raise HTTPException(404, "不存在")
+
+@app.delete("/members/{member_id}", status_code=204)
+def delete_member(member_id: int):
+    global members
+    members = [x for x in members if x["id"] != member_id]
+    return None
+''',
+}
+
+
+def test_invariant_unique_keyed_resource_does_not_collide():
+    """复合唯一键资源（同 org 内 name 唯一）：不变式测试的多次 POST 必须用不同 body。
+
+    否则第二次 POST 同名会 409，id 唯一 / 计数一致两条不变式误报失败。这是对
+    org_scoped_unique 案例「复合唯一键撞车」的确定性回归。
+    """
+    inv = generate_invariant_tests([COMPOSITE_UNIQUE_MAIN])
+    assert "test_invariant_id_unique" in inv, inv
+    assert "test_invariant_count_consistent" in inv, inv
+    data = asyncio.run(run_tests(
+        [COMPOSITE_UNIQUE_MAIN],
+        [{"path": "tests/test_invariants.py", "content": inv, "language": "python"}],
+    ))
+    assert data["all_passed"] is True, data
+
+
 if __name__ == "__main__":
     test_generator_derives_id_unique_without_llm()
     test_invariant_catches_id_bug()
     test_invariant_passes_fixed_code()
     test_invariant_skips_non_collection_resource()
     test_invariant_skips_delete_404_when_no_get_by_id()
-    print("[PASS] 确定性不变式测试: 从 OpenAPI 机械推导 + 抓到 next_id bug + 修复后通过 + auth 端点跳过 + 无 GET-by-id 跳过 delete_404")
+    test_invariant_unique_keyed_resource_does_not_collide()
+    print("[PASS] 确定性不变式测试: 从 OpenAPI 机械推导 + 抓到 next_id bug + 修复后通过 + auth 端点跳过 + 无 GET-by-id 跳过 delete_404 + 复合唯一键不撞车")

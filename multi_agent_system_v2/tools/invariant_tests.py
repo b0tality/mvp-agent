@@ -184,8 +184,13 @@ def _find_get_list(schema: Dict, path: str) -> bool:
     return False
 
 
-def _sample(prop: Dict) -> Any:
-    """从 schema 采样一个能通过校验的请求体值（尊重 minLength/format/enum/minimum）。"""
+def _sample(prop: Dict, suffix: str = "") -> Any:
+    """从 schema 采样一个能通过校验的请求体值（尊重 minLength/format/enum/minimum）。
+
+    suffix 只附加到「普通字符串字段」上，用来让不同测试 POST 的请求体在唯一键约束下
+    互不撞车（如 (org_id, name) 复合唯一：两次 POST 同名会 409，导致 id 唯一/计数一致
+    不变式误报）。enum / email / uuid 等字段有固定取值或格式校验，加后缀会破坏，故不动。
+    """
     t = (prop.get("type") or "").lower()
     if prop.get("enum"):
         return prop["enum"][0]
@@ -202,6 +207,8 @@ def _sample(prop: Dict) -> Any:
         except (TypeError, ValueError):
             mn = 1
         s = "x" * max(1, mn)
+        if suffix:
+            s += suffix
         if mx is not None:
             try:
                 mx = int(mx)
@@ -239,16 +246,24 @@ def generate_invariant_tests(code_files: List[Dict]) -> str:
     if not _find_get_list(schema, path):
         return ""
     id_field = res["id_field"]
-    body = {k: _sample(v) for k, v in res["request_fields"].items()}
-    body_literal = json.dumps(body, ensure_ascii=False) if body else "{}"
+    # 每个 POST 用不同的唯一后缀生成 body，避免「唯一键约束」下多次 POST 同一 body 撞车
+    # （如 (org_id, name) 复合唯一：第二次 POST 同名会 409，导致 id 唯一/计数一致不变式误报）。
+    def _body_literal(suffix: str) -> str:
+        body = {k: _sample(v, suffix) for k, v in res["request_fields"].items()}
+        return json.dumps(body, ensure_ascii=False) if body else "{}"
+
+    body_a = _body_literal("_a")
+    body_b = _body_literal("_b")
+    body_c = _body_literal("_c")
+    body_d = _body_literal("_d")
     delete_path = _find_delete_path(schema, path)
 
     tests = []
 
     # 1. id 唯一性
     tests.append(f'''def test_invariant_id_unique():
-    r1 = client.post({path!r}, json={body_literal})
-    r2 = client.post({path!r}, json={body_literal})
+    r1 = client.post({path!r}, json={body_a})
+    r2 = client.post({path!r}, json={body_b})
     assert r1.status_code in (200, 201), r1.text
     assert r2.status_code in (200, 201), r2.text
     assert r1.json()[{id_field!r}] != r2.json()[{id_field!r}]''')
@@ -256,7 +271,7 @@ def generate_invariant_tests(code_files: List[Dict]) -> str:
     # 2. 计数一致性
     tests.append(f'''def test_invariant_count_consistent():
     before = len(client.get({path!r}).json())
-    client.post({path!r}, json={body_literal})
+    client.post({path!r}, json={body_c})
     after = len(client.get({path!r}).json())
     assert after == before + 1''')
 
@@ -267,7 +282,7 @@ def generate_invariant_tests(code_files: List[Dict]) -> str:
             param = m.group(1)
             replace_src = "{" + param + "}"
             tests.append(f'''def test_invariant_delete_then_404():
-    r = client.post({path!r}, json={body_literal})
+    r = client.post({path!r}, json={body_d})
     rid = r.json()[{id_field!r}]
     url = {delete_path!r}.replace({replace_src!r}, str(rid))
     client.delete(url)
