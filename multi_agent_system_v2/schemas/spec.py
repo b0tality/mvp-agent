@@ -21,8 +21,8 @@ class EndpointSpec(BaseModel):
         description="能成功触发该端点的合法请求体示例（GET/DELETE 留空）。单个对象用 dict；批量端点（一次传多条）用 list。",
     )
     response_status: int = Field(default=200, description="成功状态码（POST 常为 201）")
-    query_params: Optional[Dict[str, str]] = Field(
-        default=None, description="查询参数示例（如 {'priority': 'high'}），无则省略。不要写进 path。"
+    query_params: Optional[Dict[str, Any]] = Field(
+        default=None, description="查询参数示例，值可为字符串或数字（如 {'priority': 'high'} 或 {'min': 10, 'max': 100}），无则省略。不要写进 path。"
     )
 
     class Config:
@@ -42,8 +42,8 @@ class RuleSpec(BaseModel):
     expect_contains: Optional[str] = Field(
         default=None, description="响应体中必须包含的子串（可选，用于核对错误信息）"
     )
-    query_params: Optional[Dict[str, str]] = Field(
-        default=None, description="触发该规则的查询参数（如 {'priority': 'nonexistent'}），无则省略。"
+    query_params: Optional[Dict[str, Any]] = Field(
+        default=None, description="触发该规则的查询参数，值可为字符串或数字（如 {'priority': 'nonexistent'} 或 {'min': 10}），无则省略。"
     )
 
     class Config:

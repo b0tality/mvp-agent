@@ -140,6 +140,21 @@ def test_derive_acceptance_emits_query_params():
     assert "?priority" not in code, "查询参数不该拼进 path"
 
 
+def test_query_params_accepts_int_values():
+    """分页/区间查询参数（limit/offset/min/max）天然是整数，schema 必须接受数字值。
+
+    回归：query_params 曾被定为 Dict[str,str]，LLM 给 {"min":10,"max":100} 会被拒，
+    触发 generate_structured 重试（catalog_filter_sort 案例实测踩过）。
+    """
+    spec = ProjectSpec(project_name="products", endpoints=[
+        EndpointSpec(method="GET", path="/products",
+                     query_params={"min": 10, "max": 100}, response_status=200),
+    ])
+    assert spec.endpoints[0].query_params == {"min": 10, "max": 100}
+    code = derive_acceptance_tests(spec)
+    assert "params={'min': 10, 'max': 100}" in code, code
+
+
 def test_derive_acceptance_does_not_skip_query_path():
     """path 里偶发混入 ?query={x} 时，不该被误判为路径参数而跳过测试。"""
     spec = ProjectSpec(project_name="tasks", endpoints=[
@@ -267,6 +282,7 @@ if __name__ == "__main__":
     test_contract_check_detects_missing_endpoint()
     test_derived_acceptance_runs_green()
     test_derive_acceptance_emits_query_params()
+    test_query_params_accepts_int_values()
     test_derive_acceptance_does_not_skip_query_path()
     test_contract_check_strips_query_from_path()
     test_derive_acceptance_409_rule_seeds_first()

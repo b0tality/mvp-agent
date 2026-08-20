@@ -27,8 +27,9 @@ _SPEC_SYSTEM = """你是一位严格的 API 规格编写器。把用户的自然
    - request_body 是「能成功触发该端点的合法 JSON 示例」（GET/DELETE 留空）。单个对象用 dict；
      批量端点（一次传多条）用 list，如 [{"name": "条目1"}, {"name": "条目2"}]。
    - response_status 是成功状态码（POST 常为 201，DELETE 常为 204，其余 200）。
-   - 查询参数（筛选/搜索/分页，如「按优先级筛选」「按书名搜索」「limit/offset」）写进 query_params 字段
-     （如 {"priority": "high"} 或 {"q": "python", "limit": "10"}），**绝对不要拼进 path**。
+   - 查询参数（筛选/搜索/分页/区间，如「按优先级筛选」「按书名搜索」「limit/offset」「价格区间」）写进 query_params 字段
+     （如 {"priority": "high"} 或 {"q": "python", "limit": 10} 或 {"min": 10, "max": 100}），
+     **值可以是字符串也可以是数字**（分页/区间用数字），**绝对不要拼进 path**。
      path 只写资源路径本身（如 /tasks 或 /books），不含 ?query=...。
 3. rules：列出**关键行为/校验规则**，每条必须能用一个 HTTP 请求客观判定，给 method / path / request_body / expect_status（必要时给 expect_contains 子串，必要时给 query_params）。
    - expect_contains 只能是字符串，不需要时**省略该字段**（不要写空数组 []、空对象 {} 或空字符串 ""）。
