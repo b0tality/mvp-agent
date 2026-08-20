@@ -34,6 +34,7 @@ from llm import OpenAIAdapter
 from agents.spec_agent import SpecAgent
 from agents.builder import BuilderAgent
 from agents.deployment import DeploymentAgent
+from agents.spec_review_agent import SpecReviewAgent
 from pipeline.spec_pipeline import run_spec_pipeline
 from benchmarks.cases import get_cases
 
@@ -43,11 +44,12 @@ def _result_file(suite: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 
-async def run_one(name: str, requirement: str, llm) -> dict:
+async def run_one(name: str, requirement: str, llm, spec_auto_review=None) -> dict:
     r = await run_spec_pipeline(
         requirement,
         SpecAgent(llm), BuilderAgent(llm), DeploymentAgent(llm),
         timeout=180,
+        spec_auto_review=spec_auto_review,
     )
     tr = r.get("test_result") or {}
     contract = r.get("contract") or {}
@@ -78,16 +80,18 @@ def _fmt_row(res: dict) -> str:
     )
 
 
-async def main(names, suite="v2") -> None:
+async def main(names, suite="v2", auto_review=True) -> None:
     cfg = PipelineConfig.from_env()
     llm = OpenAIAdapter(api_key=cfg.api_key, base_url=cfg.base_url, model=cfg.model)
 
+    spec_auto_review = SpecReviewAgent(llm).to_callback() if auto_review else None
     cases = get_cases(names, suite=suite)
-    print(f"跑 {len(cases)} 个用例（model={cfg.model} suite={suite}）...\n")
+    review_label = "on" if auto_review else "off"
+    print(f"跑 {len(cases)} 个用例（model={cfg.model} suite={suite} auto_review={review_label}）...\n")
     results = []
     for case in cases:
         t0 = time.time()
-        res = await run_one(case["name"], case["requirement"], llm)
+        res = await run_one(case["name"], case["requirement"], llm, spec_auto_review)
         results.append(res)
         print(_fmt_row(res))
         if res["gate_reasons"]:
@@ -120,5 +124,7 @@ if __name__ == "__main__":
     parser.add_argument("cases", nargs="*", help="只跑指定用例名（默认全部）")
     parser.add_argument("--suite", choices=["v1", "v2"], default="v2",
                         help="用例集：v1 首轮基线 / v2 新一轮多样形态（默认 v2）")
+    parser.add_argument("--no-auto-review", action="store_true",
+                        help="关闭 Spec 自动完备性评审（默认开启）")
     args = parser.parse_args()
-    asyncio.run(main(args.cases, args.suite))
+    asyncio.run(main(args.cases, args.suite, auto_review=not args.no_auto_review))
