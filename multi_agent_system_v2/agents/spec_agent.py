@@ -24,7 +24,8 @@ _SPEC_SYSTEM = """你是一位严格的 API 规格编写器。把用户的自然
 1. project_name：小写字母 + 下划线。
 2. endpoints：列出**所有**后端 API 端点，每个给 method / path / request_body / response_status。
    - 路径用 REST 风格，路径参数用 {id} 形式（如 /todos/{id}）。
-   - request_body 是「能成功触发该端点的合法 JSON 示例」（GET/DELETE 留空）。
+   - request_body 是「能成功触发该端点的合法 JSON 示例」（GET/DELETE 留空）。单个对象用 dict；
+     批量端点（一次传多条）用 list，如 [{"name": "条目1"}, {"name": "条目2"}]。
    - response_status 是成功状态码（POST 常为 201，DELETE 常为 204，其余 200）。
    - 查询参数（筛选/搜索/分页，如「按优先级筛选」「按书名搜索」「limit/offset」）写进 query_params 字段
      （如 {"priority": "high"} 或 {"q": "python", "limit": "10"}），**绝对不要拼进 path**。

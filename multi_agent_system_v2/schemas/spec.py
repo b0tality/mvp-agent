@@ -7,7 +7,7 @@ Spec 相关 Schema —— spec-driven 架构的「唯一真相源」
   后续所有测试与契约校验都由它**确定性推导**（零 LLM），不再有翻译环节。
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -16,8 +16,9 @@ class EndpointSpec(BaseModel):
     method: str = Field(description="HTTP 方法: GET/POST/PUT/DELETE/PATCH")
     path: str = Field(description="路径，如 /todos 或 /todos/{id}")
     summary: str = Field(default="", description="一句话说明")
-    request_body: Optional[Dict[str, Any]] = Field(
-        default=None, description="能成功触发该端点的合法请求体示例（GET/DELETE 留空）"
+    request_body: Optional[Union[Dict[str, Any], List[Any]]] = Field(
+        default=None,
+        description="能成功触发该端点的合法请求体示例（GET/DELETE 留空）。单个对象用 dict；批量端点（一次传多条）用 list。",
     )
     response_status: int = Field(default=200, description="成功状态码（POST 常为 201）")
     query_params: Optional[Dict[str, str]] = Field(
@@ -33,8 +34,9 @@ class RuleSpec(BaseModel):
     description: str = Field(description="规则说明，如「空标题返回 422」")
     method: str = Field(default="POST", description="HTTP 方法")
     path: str = Field(description="路径（不要用 {id} 参数，资源级 404 由不变式测试覆盖）")
-    request_body: Optional[Dict[str, Any]] = Field(
-        default=None, description="触发该规则的请求体（如缺字段的空 body）"
+    request_body: Optional[Union[Dict[str, Any], List[Any]]] = Field(
+        default=None,
+        description="触发该规则的请求体（如缺字段的空 body）；批量规则用 list（如 [{'name': ''}]）。",
     )
     expect_status: int = Field(description="期望状态码，如 422/400/409/404")
     expect_contains: Optional[str] = Field(

@@ -49,20 +49,23 @@ def _strip_query(path: str) -> str:
 def derive_acceptance_tests(spec) -> str:
     """从 Spec 确定性生成验收 pytest（零 LLM）。
 
-    只对「无路径参数」的端点生成简单成功测试；资源级 GET/DELETE/{id} 的往返与
-    删除 404 由不变式测试覆盖。每条 rule 生成一条断言测试。
+    - 无路径参数端点：直接生成成功测试；
+    - 带路径参数端点（子资源 / 单资源形态）：先种子父资源 POST、再用返回 id 访问，
+      补齐子资源 GET/increment/DELETE 的覆盖（原「只测无路径参数」会漏掉这些）；
+    - 每条 rule：一条断言测试。
     """
-    lines = [
+    header = [
         "import pytest",
         "from fastapi.testclient import TestClient",
         "from main import app",
         "",
         "",
         "client = TestClient(app)",
-        "",
     ]
+    body: List[str] = []
+    needs_rid = False
 
-    # 1. 端点成功测试（无路径参数）
+    # 1. 无路径参数端点：直接成功测试
     for i, ep in enumerate(spec.endpoints):
         method = (ep.method or "get").lower()
         path = _strip_query(ep.path or "/")
@@ -77,9 +80,49 @@ def derive_acceptance_tests(spec) -> str:
         if qp:
             call += f", params={qp!r}"
         call += ")"
-        lines.append(f"def {fn}():\n    r = {call}\n    assert r.status_code == {status}, r.text\n")
+        body.append(f"def {fn}():\n    r = {call}\n    assert r.status_code == {status}, r.text\n")
 
-    # 2. 规则测试
+    # 2. 带路径参数端点（子资源 / 单资源）：先种子父资源，再用 id 访问
+    for i, ep in enumerate(spec.endpoints):
+        method = (ep.method or "get").lower()
+        path = _strip_query(ep.path or "/")
+        if not _has_path_param(path):
+            continue
+        params = re.findall(r"\{([^}]+)\}", path)
+        if len(params) != 1:
+            continue  # 多路径参数（如 /x/{a}/y/{b}）无法可靠种子，宁可少测
+        param = params[0]
+        prefix = path[: path.index("{")].rstrip("/") or "/"
+        seed_body = None
+        for other in spec.endpoints:
+            if (other.method or "").lower() == "post" and _strip_query(other.path or "/") == prefix:
+                seed_body = other.request_body
+                break
+        if seed_body is None:
+            continue  # 没有可种子的父资源 POST，宁可少测不误报
+        fn = f"test_endpoint_{i}_{_path_slug(path, method)}"
+        status = ep.response_status or 200
+        call = f"client.{method}(url"
+        if ep.request_body is not None:
+            call += f", json={ep.request_body!r}"
+        qp = getattr(ep, "query_params", None) or None
+        if qp:
+            call += f", params={qp!r}"
+        call += ")"
+        replace_src = "{" + param + "}"
+        body.append(
+            f"def {fn}():\n"
+            f"    _r0 = client.post({prefix!r}, json={seed_body!r})\n"
+            f"    _rid_val = _rid(_r0)\n"
+            f"    if _rid_val is None:\n"
+            f"        pytest.skip('种子响应无 id，无法定位资源')\n"
+            f"    url = {path!r}.replace({replace_src!r}, str(_rid_val))\n"
+            f"    r = {call}\n"
+            f"    assert r.status_code == {status}, r.text\n"
+        )
+        needs_rid = True
+
+    # 3. 规则测试
     for i, rule in enumerate(spec.rules):
         method = (rule.method or "get").lower()
         path = _strip_query(rule.path or "/")
@@ -99,16 +142,37 @@ def derive_acceptance_tests(spec) -> str:
         # 必须先种一个资源、再发一次触发冲突。种子请求结果忽略（可能已被别的测试建过），
         # 不依赖执行顺序，也不改请求值，对 email/uuid 等格式字段同样安全。
         if rule.expect_status == 409 and rule.request_body is not None and method in ("post", "put"):
-            lines.append(
+            body.append(
                 f"def {fn}():\n"
                 f"    client.{method}({path!r}, json={rule.request_body!r})  # 先种资源（结果忽略，可能已存在）\n"
                 f"    r = {call}\n"
                 f"    {assert_line}\n"
             )
         else:
-            lines.append(f"def {fn}():\n    r = {call}\n    {assert_line}\n")
+            body.append(f"def {fn}():\n    r = {call}\n    {assert_line}\n")
 
-    return "\n".join(lines) + "\n"
+    # 组装：只在有子资源种子测试时才注入 _rid 辅助函数，避免平白多出无用代码
+    parts = list(header)
+    parts.append("")
+    if needs_rid:
+        parts.extend([
+            "def _rid(resp):",
+            "    try:",
+            "        data = resp.json()",
+            "    except Exception:",
+            "        return None",
+            "    if not isinstance(data, dict):",
+            "        return None",
+            "    if 'id' in data:",
+            "        return data['id']",
+            "    for _k, _v in data.items():",
+            "        if _k.lower().endswith('id'):",
+            "            return _v",
+            "    return None",
+        ])
+        parts.append("")
+    parts.extend(body)
+    return "\n".join(parts) + "\n"
 
 
 def _normalize_path(path: str) -> str:

@@ -187,6 +187,80 @@ def test_derive_acceptance_non_conflict_rule_no_seed():
     assert code.count("client.post('/todos'") == 1, code
 
 
+# ---------------------------------------------------------------------------
+# request_body 支持 list（批量端点）+ 子资源路径参数端点覆盖
+# ---------------------------------------------------------------------------
+
+COURSES_MAIN = {
+    "path": "main.py",
+    "content": '''from fastapi import FastAPI
+
+app = FastAPI()
+courses = []
+students = {}
+_next = 1
+
+@app.post("/courses", status_code=201)
+def create_course(body: dict):
+    global _next
+    c = {"id": _next, "name": body["name"]}
+    courses.append(c)
+    students[_next] = []
+    _next += 1
+    return c
+
+@app.get("/courses/{cid}/students")
+def list_students(cid: int):
+    return students.get(cid, [])
+''',
+}
+
+
+def test_request_body_accepts_list():
+    """批量端点的 request_body 应是 list 而非 dict，schema 必须接受。"""
+    spec = ProjectSpec(project_name="bulk", endpoints=[
+        EndpointSpec(method="POST", path="/items/bulk",
+                     request_body=[{"name": "a"}, {"name": "b"}], response_status=201),
+    ], rules=[
+        RuleSpec(description="空名整体 422", method="POST", path="/items/bulk",
+                 request_body=[{"name": ""}], expect_status=422),
+    ])
+    assert spec.endpoints[0].request_body == [{"name": "a"}, {"name": "b"}]
+    assert spec.rules[0].request_body == [{"name": ""}]
+    code = derive_acceptance_tests(spec)
+    assert "json=[{'name': 'a'}, {'name': 'b'}]" in code, code
+
+
+def test_derive_acceptance_seeds_path_param_endpoint():
+    """带路径参数的子资源端点应生成「先种父资源再用 id 访问」的测试。"""
+    spec = ProjectSpec(project_name="courses", endpoints=[
+        EndpointSpec(method="POST", path="/courses",
+                     request_body={"name": "math"}, response_status=201),
+        EndpointSpec(method="GET", path="/courses/{cid}/students", response_status=200),
+    ])
+    code = derive_acceptance_tests(spec)
+    assert "client.post('/courses', json={'name': 'math'})" in code, code
+    assert "_rid_val = _rid(_r0)" in code, code
+    assert ".replace('{cid}', str(_rid_val))" in code, code
+    assert "def _rid(resp):" in code, code
+    assert "test_endpoint_1_" in code, code
+
+
+def test_derived_acceptance_path_param_runs_green():
+    """子资源种子测试对正确实现应真实跑绿。"""
+    spec = ProjectSpec(project_name="courses", endpoints=[
+        EndpointSpec(method="POST", path="/courses",
+                     request_body={"name": "math"}, response_status=201),
+        EndpointSpec(method="GET", path="/courses/{cid}/students", response_status=200),
+    ])
+    code = derive_acceptance_tests(spec)
+    data = asyncio.run(run_tests(
+        [COURSES_MAIN],
+        [{"path": "tests/test_acceptance.py", "content": code, "language": "python"}],
+    ))
+    assert data["all_passed"] is True, data
+
+
 if __name__ == "__main__":
     test_derive_acceptance_deterministic()
     test_contract_check_matches()
@@ -197,4 +271,7 @@ if __name__ == "__main__":
     test_contract_check_strips_query_from_path()
     test_derive_acceptance_409_rule_seeds_first()
     test_derive_acceptance_non_conflict_rule_no_seed()
-    print("[PASS] spec_derive: 确定性验收推导 + 契约校验 + query 参数修复 + 409 种子")
+    test_request_body_accepts_list()
+    test_derive_acceptance_seeds_path_param_endpoint()
+    test_derived_acceptance_path_param_runs_green()
+    print("[PASS] spec_derive: 确定性验收推导 + 契约校验 + query 参数修复 + 409 种子 + list body + 子资源种子")
